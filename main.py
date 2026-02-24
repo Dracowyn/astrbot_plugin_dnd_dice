@@ -1,0 +1,188 @@
+"""
+main.py — AstrBot DnD D20 骰子插件入口。
+
+指令：
+  /r [表达式]    使用 DnD 骰池语法掷骰。
+  /roll [表达式] /r 的别名。
+
+支持的骰池语法：
+  d20                    单个 d20。
+  1d20+5                 1 枚 d20 加 +5 修正。
+  2d6-1                  2 枚 d6 减 1 修正。
+  4d6kh3                 掷 4d6，保留最高 3 个。
+  2d20kl1                掷 2d20，保留最低 1 个（劣势）。
+  d20adv                 优势骰（2d20kh1 的简写）。
+  d20dis                 劣势骰（2d20kl1 的简写）。
+  d6!                    爆炸骰。
+  2d6+1d4+3              多骰组合加修正值。
+  1d20+5#攻击检定        用 '#' 分隔附加标签。
+  1d20+5 攻击检定        用空格分隔附加标签。
+  d20 感知 15            技能检定：标签 + DC，输出"成功/失败"。
+  d20感知15              同上，无空格写法等价。
+  d20+3 奥秘 12          带修正值的技能检定。
+  d20adv 察觉 13         优势技能检定。
+
+LLM 函数工具：
+  插件注册了 `roll_dice` 工具，LLM 可在 TRPG 叙事中自动调用该工具掷骰。
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+
+from .character import CharacterManager
+from .dice_parser import DiceParseError, parse
+from .dice_roller import DiceRollError, roll
+from .formatter import format_result
+
+# ---------------------------------------------------------------------------
+# 解析失败或请求帮助时显示的语法提示
+# ---------------------------------------------------------------------------
+
+_SYNTAX_HELP = (
+    "用法: /r [骰池表达式] [标签] [DC]\n"
+    "示例:\n"
+    "  /r d20\n"
+    "  /r 1d20+5\n"
+    "  /r 4d6kh3\n"
+    "  /r d20adv\n"
+    "  /r d20dis\n"
+    "  /r d6!\n"
+    "  /r 2d6+1d4+3 伤害\n"
+    "  /r 1d20+5#攻击检定\n"
+    "  /r d20 感知 15\n"
+    "  /r d20感知15\n"
+    "  /r d20+3 奥秘 12"
+)
+
+
+# ---------------------------------------------------------------------------
+# 插件主类
+# ---------------------------------------------------------------------------
+
+
+@register(
+    "astrbot_plugin_dnd_dice",
+    "Dracowyn",
+    "支持完整 DnD 骰池语法的掷骰插件，含优势/劣势、爆炸骰及 LLM 函数工具调用。",
+    "1.0.0",
+)
+class DnDDicePlugin(Star):
+    def __init__(self, context: Context, config: dict | None = None) -> None:
+        super().__init__(context)
+        cfg = config or {}
+        self.max_dice_count: int = int(cfg.get("max_dice_count", 100))
+        self.max_dice_sides: int = int(cfg.get("max_dice_sides", 1000))
+        self.exploding_max_depth: int = int(cfg.get("exploding_max_depth", 20))
+        self.show_detail: bool = bool(cfg.get("show_detail", True))
+
+        # 角色卡管理器（当前版本为存根，尚未实现持久化）
+        self.character_manager = CharacterManager(star=self)
+
+    async def initialize(self) -> None:
+        logger.info(
+            "[dnd_dice] DnD D20 骰子插件已加载。"
+            f"限制: 最多骰子数={self.max_dice_count}, 最大面数={self.max_dice_sides}, "
+            f"爆炸深度={self.exploding_max_depth}, 显示明细={self.show_detail}"
+        )
+
+    # ------------------------------------------------------------------
+    # 内部辅助方法
+    # ------------------------------------------------------------------
+
+    def _do_roll(self, expression_str: str) -> str:
+        """
+        解析、执行并格式化一条骰池表达式。
+
+        返回纯文本结果字符串，所有异常均被捕获并转换为可读错误信息。
+        """
+        try:
+            expr = parse(expression_str)
+        except DiceParseError as e:
+            return f"解析错误: {e}\n{_SYNTAX_HELP}"
+
+        try:
+            result = roll(
+                expr,
+                max_dice=self.max_dice_count,
+                max_sides=self.max_dice_sides,
+                exploding_depth=self.exploding_max_depth,
+            )
+        except DiceRollError as e:
+            return f"掷骰错误: {e}"
+
+        return format_result(result, show_detail=self.show_detail)
+
+    # ------------------------------------------------------------------
+    # /r 指令处理器
+    # ------------------------------------------------------------------
+
+    @filter.command("r", alias={"roll"})
+    async def roll_cmd(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """
+        使用 DnD 骰池语法掷骰。
+
+        用法: /r [骰池表达式] [标签] [DC]
+        示例: /r 1d20+5, /r 4d6kh3, /r d20adv, /r d6!, /r 2d6+1d4+3 伤害
+              /r d20 感知 15, /r d20感知15, /r d20+3 奥秘 12
+        """
+        raw_msg: str = event.message_str.strip()
+
+        # 去掉开头的指令名（/r 或 /roll），提取骰池表达式部分。
+        parts = raw_msg.split(None, 1)  # 按第一个空白字符分割
+        expression_str = parts[1].strip() if len(parts) > 1 else ""
+
+        # 无参数时默认掷一个 d20
+        if not expression_str:
+            expression_str = "d20"
+
+        output = self._do_roll(expression_str)
+        yield event.plain_result(output)
+
+    # ------------------------------------------------------------------
+    # LLM 函数工具
+    # ------------------------------------------------------------------
+
+    @filter.llm_tool(name="roll_dice")
+    async def roll_dice_tool(
+        self,
+        event: AstrMessageEvent,
+        expression: str,
+        label: str = "",
+    ) -> str:
+        """
+        在 TRPG/DnD 游戏中掷骰子。当需要进行攻击骰、伤害骰、属性检定、豁免
+        或任何需要随机结果的场合时调用此工具。
+
+        Args:
+            expression(string): DnD 标准骰池表达式。
+                示例: "1d20", "1d20+5", "2d6+3", "4d6kh3",
+                "d20adv", "d20dis", "d6!", "2d6+1d4"
+            label(string): 本次投掷的说明，例如"攻击检定"、"力量检定"、"火球伤害"。
+                技能检定时可在标签末尾附加 DC 数字，如 "感知 15" 或 "感知15"，
+                插件将自动判断成功/失败。不需要标签时可传空字符串。
+        """
+        # 将标签拼入表达式，交给解析器处理。
+        if label:
+            full_expr = f"{expression}#{label}"
+        else:
+            full_expr = expression
+
+        output = self._do_roll(full_expr)
+
+        # 向用户发送骰点结果。
+        await event.send(event.plain_result(output))
+
+        # 将结果返回给 LLM，供其融入后续叙事。
+        return output
+
+    # ------------------------------------------------------------------
+    # 插件卸载
+    # ------------------------------------------------------------------
+
+    async def terminate(self) -> None:
+        logger.info("[dnd_dice] DnD D20 骰子插件已卸载。")

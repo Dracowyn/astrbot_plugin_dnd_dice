@@ -1,0 +1,41 @@
+{
+    "max_dice_count": {
+        "description": "单次投掷每组最多骰子数",
+        "hint": "超出此数量的投掷请求将被拒绝，防止滥用",
+        "type": "int",
+        "default": 100,
+        "slider": {
+            "min": 1,
+            "max": 1000,
+            "step": 1
+        }
+    },
+    "max_dice_sides": {
+        "description": "骰子最大面数",
+        "hint": "超出此面数的骰子请求将被拒绝",
+        "type": "int",
+        "default": 1000,
+        "slider": {
+            "min": 2,
+            "max": 10000,
+            "step": 1
+        }
+    },
+    "exploding_max_depth": {
+        "description": "爆炸骰最大递归深度",
+        "hint": "防止爆炸骰无限循环，建议设置为 20~50",
+        "type": "int",
+        "default": 20,
+        "slider": {
+            "min": 1,
+            "max": 100,
+            "step": 1
+        }
+    },
+    "show_detail": {
+        "description": "默认显示骰子明细",
+        "hint": "开启后每次投掷都会显示每个骰子的具体点数",
+        "type": "bool",
+        "default": true
+    }
+}
