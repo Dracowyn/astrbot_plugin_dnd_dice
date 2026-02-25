@@ -91,7 +91,7 @@ _SYNTAX_HELP = (
     "astrbot_plugin_dnd_dice",
     "Dracowyn",
     "支持完整 Roll20 骰池规范的 DnD 掷骰插件，含 FATE 骰、丢弃骰、爆炸变体、成功计数、重骰、排序及 LLM 工具调用。",
-    "2.0.0",
+    "0.2.0",
 )
 class DnDDicePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
