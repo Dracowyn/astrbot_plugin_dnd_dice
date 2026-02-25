@@ -151,6 +151,12 @@ class DnDDicePlugin(Star):
             cfg.get("allow_private_bypass_whitelist"), True
         )
 
+        # 自定义触发前缀配置
+        self.default_cmd_prefix: str = str(cfg.get("default_cmd_prefix") or "")
+        self.allow_custom_prefix: bool = _safe_bool(
+            cfg.get("allow_custom_prefix"), True
+        )
+
         # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
         self._character_manager: CharacterManager | None = None
 
@@ -183,19 +189,28 @@ class DnDDicePlugin(Star):
         sides = await self.get_kv_data(key, self.default_dice_sides)
         return _safe_int(sides, self.default_dice_sides, min_val=2)
 
-    async def _check_permission(self, event: AstrMessageEvent) -> bool:
+    async def _get_effective_prefix(self, event: AstrMessageEvent) -> str:
         """
-        检查当前用户是否有权使用 /dset 命令。
+        获取当前会话的有效自定义触发前缀。
+
+        优先使用会话级设置（通过 /rprefix 命令设置），不存在则回退到全局配置值。
+        """
+        key = f"custom_prefix:{event.unified_msg_origin}"
+        prefix = await self.get_kv_data(key, None)
+        if prefix is not None:
+            return str(prefix)
+        return self.default_cmd_prefix
+
+    async def _whitelist_check(self, event: AstrMessageEvent) -> bool:
+        """
+        通用白名单验证（不含功能开关检查）。
 
         判断顺序：
-        1. allow_session_dice_sides 为 False → 始终拒绝
-        2. enable_whitelist 为 False → 始终允许
-        3. 私聊且 allow_private_bypass_whitelist → 允许
-        4. whitelist_users 非空 → 检查 sender_id 是否在列表中
-        5. whitelist_users 为空 → 使用 AstrBot 管理员判断
+        1. enable_whitelist 为 False → 始终允许
+        2. 私聊且 allow_private_bypass_whitelist → 允许
+        3. whitelist_users 非空 → 检查 sender_id 是否在列表中
+        4. whitelist_users 为空 → 使用 AstrBot 管理员判断
         """
-        if not self.allow_session_dice_sides:
-            return False
         if not self.enable_whitelist:
             return True
         if self.allow_private_bypass_whitelist and event.is_private_chat():
@@ -205,6 +220,30 @@ class DnDDicePlugin(Star):
             return sender_id in self.whitelist_users
         # 白名单为空，回退到 AstrBot 全局管理员
         return event.is_admin()
+
+    async def _check_permission(self, event: AstrMessageEvent) -> bool:
+        """
+        检查当前用户是否有权使用 /dset 命令。
+
+        判断顺序：
+        1. allow_session_dice_sides 为 False → 始终拒绝
+        2. 通用白名单验证
+        """
+        if not self.allow_session_dice_sides:
+            return False
+        return await self._whitelist_check(event)
+
+    async def _check_prefix_permission(self, event: AstrMessageEvent) -> bool:
+        """
+        检查当前用户是否有权使用 /rprefix 命令。
+
+        判断顺序：
+        1. allow_custom_prefix 为 False → 始终拒绝
+        2. 通用白名单验证
+        """
+        if not self.allow_custom_prefix:
+            return False
+        return await self._whitelist_check(event)
 
     # ------------------------------------------------------------------
     # 内部辅助方法
@@ -280,7 +319,7 @@ class DnDDicePlugin(Star):
 
         用法:
           /dset <面数>     将当前会话默认骰面数设为指定值
-          /dset reset     清除会话设置，恢复为全局默认
+          /dset reset     清除默认骰子面数设置，恢复为全局默认
           /dset           查看当前会话的默认骰面数
         """
         raw_msg: str = event.message_str.strip()
@@ -345,9 +384,186 @@ class DnDDicePlugin(Star):
 
         await self.put_kv_data(key, new_sides)
         yield event.plain_result(
-            f"已将当前默认骰面数设为 d{new_sides}。"
-            f"后续 /r 将默认投掷 d{new_sides}。"
+            f"已将当前默认骰面数设为 d{new_sides}。后续 /r 将默认投掷 d{new_sides}。"
         )
+
+    @filter.command("rprefix")
+    async def rprefix_cmd(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """
+        设置或查询当前会话的自定义骰子指令触发前缀。
+
+        用法:
+          /rprefix              查看当前会话的有效前缀
+          /rprefix <前缀>       将当前会话触发前缀设为指定符号（如 . 或 !）
+          /rprefix reset        清除会话前缀，恢复全局默认
+        """
+        raw_msg: str = event.message_str.strip()
+        parts = raw_msg.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        key = f"custom_prefix:{event.unified_msg_origin}"
+
+        # 查询当前前缀
+        if not arg:
+            current = await self._get_effective_prefix(event)
+            if current:
+                yield event.plain_result(
+                    f"当前触发前缀：{current!r}\n"
+                    f"用法：/rprefix <前缀> 设置前缀（如 /rprefix . 或 /rprefix !）\n"
+                    f"重置：/rprefix reset"
+                )
+            else:
+                yield event.plain_result(
+                    f"当前未设置自定义前缀，使用系统默认前缀\n"
+                    f"用法：/rprefix <前缀> 设置前缀（如 /rprefix . 或 /rprefix !）"
+                )
+            return
+
+        # 权限检查
+        if not await self._check_prefix_permission(event):
+            if not self.allow_custom_prefix:
+                yield event.plain_result("管理员已禁用自定义触发前缀功能。")
+            else:
+                yield event.plain_result(
+                    "你没有权限使用此命令。"
+                    + (
+                        "（白名单模式已启用，请联系管理员）"
+                        if self.enable_whitelist
+                        else ""
+                    )
+                )
+            return
+
+        # 重置会话前缀
+        if arg.lower() in ("reset", "重置", "清除"):
+            await self.delete_kv_data(key)
+            if self.default_cmd_prefix:
+                yield event.plain_result(
+                    f"已清除自定义骰子前缀设置，恢复为默认前缀 {self.default_cmd_prefix!r}。"
+                )
+            else:
+                yield event.plain_result("已清除自定义骰子前缀设置，使用默认前缀。")
+            return
+
+        # 前缀长度校验
+        if len(arg) > 5:
+            yield event.plain_result("前缀过长，建议使用 1~2 个字符（如 . 或 !!）。")
+            return
+
+        await self.put_kv_data(key, arg)
+        yield event.plain_result(
+            f"已将自定义骰子前缀设为 {arg!r}。\n"
+            f"现在可用 {arg}r、{arg}roll、{arg}dset 等触发骰子功能，\n"
+            f"也可继续使用 /r 等前缀。"
+        )
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def custom_prefix_route(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """
+        自定义触发前缀消息路由。
+
+        读取会话或全局配置的自定义前缀，将 {prefix}r / {prefix}roll / {prefix}dset 等
+        消息路由到对应的掷骰或骰面设置逻辑。
+        """
+        prefix = await self._get_effective_prefix(event)
+        if not prefix:
+            return
+
+        text = event.message_str.strip()
+        if not text:
+            return
+
+        text_lower = text.lower()
+        p = prefix.lower()
+
+        # --- 骰池指令匹配 ---
+        for cmd_key in (f"{p}roll", f"{p}r"):
+            if (
+                text_lower == cmd_key
+                or text_lower.startswith(cmd_key + " ")
+                or text_lower.startswith(cmd_key + "\n")
+            ):
+                arg_part = text[len(cmd_key) :].strip()
+                effective_sides = await self._get_effective_sides(event)
+                expression_str = arg_part if arg_part else f"d{effective_sides}"
+                output = self._do_roll(expression_str, default_sides=effective_sides)
+                yield event.plain_result(output)
+                event.stop_event()
+                return
+
+        # --- 骰面设置指令匹配 ---
+        for cmd_key in (f"{p}dice_set", f"{p}dset"):
+            if (
+                text_lower == cmd_key
+                or text_lower.startswith(cmd_key + " ")
+                or text_lower.startswith(cmd_key + "\n")
+            ):
+                arg = text[len(cmd_key) :].strip()
+                key = f"session_sides:{event.unified_msg_origin}"
+
+                if not arg:
+                    current = await self._get_effective_sides(event)
+                    is_session_set = await self.get_kv_data(key, None) is not None
+                    source = "会话设置" if is_session_set else "默认"
+                    yield event.plain_result(
+                        f"当前默认骰面数: d{current}（{source}）\n"
+                        f"用法: {prefix}dset <面数>\n"
+                        f"示例: {prefix}dset 6\n"
+                        f"重置: {prefix}dset reset"
+                    )
+                    event.stop_event()
+                    return
+
+                if not await self._check_permission(event):
+                    if not self.allow_session_dice_sides:
+                        yield event.plain_result("管理员已禁用会话骰面设置功能。")
+                    else:
+                        yield event.plain_result(
+                            "你没有权限使用此命令。"
+                            + (
+                                "（白名单模式已启用，请联系管理员）"
+                                if self.enable_whitelist
+                                else ""
+                            )
+                        )
+                    event.stop_event()
+                    return
+
+                if arg.lower() in ("reset", "重置", "0"):
+                    await self.delete_kv_data(key)
+                    yield event.plain_result(
+                        f"已清除骰面设置，恢复为默认 d{self.default_dice_sides}。"
+                    )
+                    event.stop_event()
+                    return
+
+                try:
+                    new_sides = int(arg)
+                except ValueError:
+                    yield event.plain_result(
+                        f"无效的面数: '{arg}'，请输入 2~{self.max_dice_sides} 之间的整数，或 reset 重置。"
+                    )
+                    event.stop_event()
+                    return
+
+                if new_sides < 2:
+                    yield event.plain_result("骰面数不能小于 2。")
+                    event.stop_event()
+                    return
+                if new_sides > self.max_dice_sides:
+                    yield event.plain_result(
+                        f"骰面数不能超过限制 {self.max_dice_sides}。"
+                    )
+                    event.stop_event()
+                    return
+
+                await self.put_kv_data(key, new_sides)
+                yield event.plain_result(
+                    f"已将当前默认骰面数设为 d{new_sides}。"
+                    f"后续 {prefix}r 将默认投掷 d{new_sides}。"
+                )
+                event.stop_event()
+                return
 
     @filter.llm_tool(name="roll_dice")
     async def roll_dice_tool(

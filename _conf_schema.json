@@ -72,5 +72,17 @@
         "hint": "启用后，私聊会话中的用户无需在白名单中即可使用 /dset 命令",
         "type": "bool",
         "default": true
+    },
+    "default_cmd_prefix": {
+        "description": "全局默认触发前缀",
+        "hint": "除系统默认前缀 / 外，额外响应的触发符号（如填写 . 则 .r 和 /r 均可触发掷骰），留空则仅响应系统默认前缀",
+        "type": "string",
+        "default": ""
+    },
+    "allow_custom_prefix": {
+        "description": "允许用户设置会话级触发前缀",
+        "hint": "启用后，用户可使用 /rprefix <符号> 为当前会话独立设置触发前缀（受白名单限制）",
+        "type": "bool",
+        "default": true
     }
 }
