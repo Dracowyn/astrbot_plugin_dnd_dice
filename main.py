@@ -50,6 +50,36 @@ from .dice_roller import DiceRollError, roll
 from .formatter import format_result
 
 # ---------------------------------------------------------------------------
+# 配置读取辅助函数
+# ---------------------------------------------------------------------------
+
+
+def _safe_int(value: object, default: int, min_val: int | None = None) -> int:
+    """将任意配置值安全转换为 int，转换失败或低于下限时返回默认值。"""
+    try:
+        result = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    if min_val is not None and result < min_val:
+        return default
+    return result
+
+
+def _safe_bool(value: object, default: bool) -> bool:
+    """将任意配置值安全转换为 bool，转换失败时返回默认值。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() not in ("false", "0", "no", "off", "")
+    try:
+        return bool(value)
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
 # 解析失败或请求帮助时显示的语法提示
 # ---------------------------------------------------------------------------
 
@@ -97,13 +127,23 @@ class DnDDicePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         cfg = config or {}
-        self.max_dice_count: int = int(cfg.get("max_dice_count", 100))
-        self.max_dice_sides: int = int(cfg.get("max_dice_sides", 1000))
-        self.exploding_max_depth: int = int(cfg.get("exploding_max_depth", 20))
-        self.show_detail: bool = bool(cfg.get("show_detail", True))
+        # _safe_int / _safe_bool 防止非数字字符串或越界值导致插件加载失败
+        self.max_dice_count: int = _safe_int(cfg.get("max_dice_count"), 100, min_val=1)
+        self.max_dice_sides: int = _safe_int(cfg.get("max_dice_sides"), 1000, min_val=1)
+        self.exploding_max_depth: int = _safe_int(
+            cfg.get("exploding_max_depth"), 20, min_val=1
+        )
+        self.show_detail: bool = _safe_bool(cfg.get("show_detail"), True)
 
-        # 角色卡管理器（当前版本为存根，尚未实现持久化）
-        self.character_manager = CharacterManager(star=self)
+        # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
+        self._character_manager: CharacterManager | None = None
+
+    @property
+    def character_manager(self) -> CharacterManager:
+        """懒加载角色卡管理器（核心持久化接口在后续版本中实现）。"""
+        if self._character_manager is None:
+            self._character_manager = CharacterManager(star=self)
+        return self._character_manager
 
     async def initialize(self) -> None:
         logger.info(
@@ -137,7 +177,11 @@ class DnDDicePlugin(Star):
         except DiceRollError as e:
             return f"掷骰错误: {e}"
 
-        return format_result(result, show_detail=self.show_detail)
+        try:
+            return format_result(result, show_detail=self.show_detail)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(f"[dnd_dice] 格式化结果时发生意外错误: {e}")
+            return f"掷骰完成，但系统内部错误"
 
     # ------------------------------------------------------------------
     # /r 指令处理器
