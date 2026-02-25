@@ -57,6 +57,23 @@ class AbilityScores:
     wisdom: int = 10
     charisma: int = 10
 
+    def __post_init__(self) -> None:
+        """Clamp ability scores to the legal DnD range [1, 30]."""
+        for attr in (
+            "strength",
+            "dexterity",
+            "constitution",
+            "intelligence",
+            "wisdom",
+            "charisma",
+        ):
+            raw = getattr(self, attr)
+            try:
+                clamped = max(1, min(30, int(raw)))
+            except (TypeError, ValueError):
+                clamped = 10
+            object.__setattr__(self, attr, clamped)
+
     def get(self, ability: str) -> int:
         """根据属性缩写（str/dex/con/int/wis/cha）返回对应属性值。"""
         mapping = {
@@ -95,6 +112,16 @@ class CharacterSheet:
     save_proficiencies: set[str] = field(default_factory=set)
     # 自定义命名掷骰快捷方式：{"攻击": "1d20+5", "偷袭": "2d6"}
     named_rolls: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Clamp level to the legal 5e range [1, 20]
+        try:
+            self.level = max(1, min(20, int(self.level)))
+        except (TypeError, ValueError):
+            self.level = 1
+        # Normalize proficiency sets to lowercase for consistent lookup
+        self.skill_proficiencies = {s.lower() for s in self.skill_proficiencies}
+        self.save_proficiencies = {s.lower() for s in self.save_proficiencies}
 
     @property
     def proficiency_bonus(self) -> int:
@@ -149,33 +176,28 @@ class CharacterManager:
         """
         加载 user_id 对应的角色卡。
 
+        当前实现：仅内存缓存，不跨会话持久化。
         未来实现：从 KV 存储反序列化。
-        当前实现：抛出 NotImplementedError。
         """
-        raise NotImplementedError(
-            "CharacterManager.load() 尚未实现，角色卡功能将在后续版本中加入。"
-        )
+        return self._cache.get(user_id)
 
     async def save(self, user_id: str, sheet: CharacterSheet) -> None:
         """
         持久化 user_id 对应的角色卡。
 
+        当前实现：仅内存缓存，不跨会话持久化。
         未来实现：序列化到 KV 存储。
-        当前实现：抛出 NotImplementedError。
         """
-        raise NotImplementedError(
-            "CharacterManager.save() 尚未实现，角色卡功能将在后续版本中加入。"
-        )
+        self._cache[user_id] = sheet
 
     async def delete(self, user_id: str) -> None:
         """
         删除 user_id 对应的角色卡。
 
-        当前实现：抛出 NotImplementedError。
+        当前实现：仅从内存缓存移除。
+        未来实现：同时从 KV 存储删除。
         """
-        raise NotImplementedError(
-            "CharacterManager.delete() 尚未实现，角色卡功能将在后续版本中加入。"
-        )
+        self._cache.pop(user_id, None)
 
     def get_cached(self, user_id: str) -> CharacterSheet | None:
         """返回内存缓存中的角色卡（不访问 KV 存储）。"""
