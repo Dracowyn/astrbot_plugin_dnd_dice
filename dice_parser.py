@@ -193,7 +193,7 @@ def parse(raw: str) -> ParsedExpression:
             m2 = _INT_TOKEN_RE.match(expr_str, pos)
             if m2:
                 found_any = True
-                flat_modifier += sign * int(m2.group(1))
+                flat_modifier += sign * int(m2.group(0))
                 pos = m2.end()
             else:
                 raise DiceParseError(
