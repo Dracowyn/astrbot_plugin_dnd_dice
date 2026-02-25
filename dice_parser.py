@@ -184,34 +184,36 @@ def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
                 group.keep_mode = "kh"
                 group.keep_n = kn if kn is not None else 1
         elif ch == "d":
-            # 丢弃：需要 dl/dh/d(数字) 三种情况
-            # 避免误把下一骰组的 'd' 消耗掉：必须有 h/l 或紧跟数字
-            peek = pos + 1
-            if peek < n and expr[peek].lower() == "h":
-                pos += 2  # consume 'd' + 'h'
-                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                group.drop_mode = "dh"
-                group.drop_n = dn if dn is not None else 1
-            elif peek < n and expr[peek].lower() == "l":
-                pos += 2  # consume 'd' + 'l'
-                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                group.drop_mode = "dl"
-                group.drop_n = dn if dn is not None else 1
-            elif peek < n and expr[peek].isdigit():
-                pos += 1  # consume 'd'
-                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                group.drop_mode = "dl"  # 'd' 简写 = dl（丢弃最低，与 Roll20 一致）
-                group.drop_n = dn if dn is not None else 1
-            # else: 不是丢弃修饰，可能是下一骰组的开始 → 不消耗
-        # adv / dis 语法糖
+            # 先检查 'dis' 语法糖，避免被 drop 分支误匹配
+            if pos + 3 <= n and expr[pos : pos + 3].lower() == "dis":
+                group.count = 2
+                group.keep_mode = "kl"
+                group.keep_n = 1
+                pos += 3
+            else:
+                # 丢弃：需要 dl/dh/d(数字) 三种情况
+                # 避免误把下一骰组的 'd' 消耗掉：必须有 h/l 或紧跟数字
+                peek = pos + 1
+                if peek < n and expr[peek].lower() == "h":
+                    pos += 2  # consume 'd' + 'h'
+                    dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                    group.drop_mode = "dh"
+                    group.drop_n = dn if dn is not None else 1
+                elif peek < n and expr[peek].lower() == "l":
+                    pos += 2  # consume 'd' + 'l'
+                    dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                    group.drop_mode = "dl"
+                    group.drop_n = dn if dn is not None else 1
+                elif peek < n and expr[peek].isdigit():
+                    pos += 1  # consume 'd'
+                    dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                    group.drop_mode = "dl"  # 'd' 简写 = dl（丢弃最低，与 Roll20 一致）
+                    group.drop_n = dn if dn is not None else 1
+                # else: 不是丢弃修饰，可能是下一骰组的开始 → 不消耗
+        # adv 语法糖（dis 已在 ch == "d" 分支内处理）
         elif expr[pos : pos + 3].lower() == "adv":
             group.count = 2
             group.keep_mode = "kh"
-            group.keep_n = 1
-            pos += 3
-        elif expr[pos : pos + 3].lower() == "dis":
-            group.count = 2
-            group.keep_mode = "kl"
             group.keep_n = 1
             pos += 3
 
