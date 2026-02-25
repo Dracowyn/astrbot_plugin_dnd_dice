@@ -5,7 +5,10 @@ formatter.py — DnD 骰点结果的纯文本格式化器。
   - 不使用任何 Markdown 语法（无 **、~~、>、-、# 等）
   - 不使用 emoji
   - 被丢弃的骰子用括号标注，如 (1)
+  - 被重骰替换的原始值附加波浪线，如 ~2~
   - 爆炸追加骰附加 "!" 后缀，如 6!
+  - FATE 骰面映射：-1 → "-", 0 → "0", 1 → "+"
+  - 成功计数模式下，计入成功的骰值标注 *，计入失败的标注 x
   - 天然 20 / 天然 1 在结果行末注释
   - show_detail=False 时仅显示：<表达式> = <总计>
 """
@@ -15,66 +18,152 @@ from __future__ import annotations
 from .dice_roller import DiceGroupResult, RollResult
 
 # ---------------------------------------------------------------------------
+# FATE 骰值映射
+# ---------------------------------------------------------------------------
+
+_FATE_DISPLAY = {-1: "-", 0: "0", 1: "+"}
+
+
+def _fate_str(v: int) -> str:
+    return _FATE_DISPLAY.get(v, str(v))
+
+
+# ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
 
 
 def _group_label(gr: DiceGroupResult) -> str:
-    """为单组骰子构建可读标签，如 '4d6kh3' 或 'd20adv'。"""
+    """为单组骰子构建可读标签，如 '4d6kh3'、'd20adv'、'5d6!!'、'3d6>3'。"""
     g = gr.group
-    # 重建近似原始表达式记号
     count_str = str(g.count) if g.count != 1 else ""
-    base = f"{count_str}d{g.sides}"
 
-    if g.keep_mode == "kh" and g.keep_n == 1 and g.count == 2:
-        suffix = "adv"
-    elif g.keep_mode == "kl" and g.keep_n == 1 and g.count == 2:
-        suffix = "dis"
-    elif g.keep_mode == "kh" and g.keep_n is not None:
-        suffix = f"kh{g.keep_n}"
-    elif g.keep_mode == "kl" and g.keep_n is not None:
-        suffix = f"kl{g.keep_n}"
+    if g.fate:
+        base = f"{count_str}dF"
     else:
-        suffix = ""
+        base = f"{count_str}d{g.sides}"
 
-    explode_mark = "!" if g.exploding else ""
+    # keep / drop 后缀
+    if g.keep_mode == "kh" and g.keep_n == 1 and g.count == 2:
+        kd_suffix = "adv"
+    elif g.keep_mode == "kl" and g.keep_n == 1 and g.count == 2:
+        kd_suffix = "dis"
+    elif g.keep_mode == "kh" and g.keep_n is not None:
+        kd_suffix = f"kh{g.keep_n}"
+    elif g.keep_mode == "kl" and g.keep_n is not None:
+        kd_suffix = f"kl{g.keep_n}"
+    elif g.drop_mode == "dl" and g.drop_n is not None:
+        kd_suffix = f"dl{g.drop_n}"
+    elif g.drop_mode == "dh" and g.drop_n is not None:
+        kd_suffix = f"dh{g.drop_n}"
+    else:
+        kd_suffix = ""
+
+    # 爆炸后缀
+    if g.exploding:
+        if g.explode_mode == "compound":
+            explode_mark = "!!"
+        elif g.explode_mode == "penetrate":
+            explode_mark = "!p"
+        else:
+            explode_mark = "!"
+        # 自定义爆炸阈值
+        if g.explode_compare is not None and g.explode_value is not None:
+            cmp = "" if g.explode_compare == "=" else g.explode_compare
+            explode_mark += f"{cmp}{g.explode_value}"
+    else:
+        explode_mark = ""
+
+    # 成功/失败计数
+    success_str = ""
+    if g.success_compare is not None and g.success_value is not None:
+        cmp = "" if g.success_compare == "=" else g.success_compare
+        success_str = f"{cmp}{g.success_value}"
+    failure_str = ""
+    if g.failure_compare is not None and g.failure_value is not None:
+        cmp = "" if g.failure_compare == "=" else g.failure_compare
+        failure_str = f"f{cmp}{g.failure_value}"
+
+    # 重骰后缀
+    reroll_str_parts = []
+    for cond in g.reroll_conditions:
+        prefix = "ro" if cond.once else "r"
+        cmp = "" if cond.compare == "=" else cond.compare
+        reroll_str_parts.append(f"{prefix}{cmp}{cond.value}")
+    reroll_str = "".join(reroll_str_parts)
+
+    # 排序后缀
+    if g.sort_order == "desc":
+        sort_str = "sd"
+    elif g.sort_order == "asc":
+        sort_str = "s"
+    else:
+        sort_str = ""
+
     sign = "-" if gr.negated else ""
-    return f"{sign}{base}{suffix}{explode_mark}"
+    return f"{sign}{base}{kd_suffix}{explode_mark}{success_str}{failure_str}{reroll_str}{sort_str}"
 
 
 def _format_dice_list(gr: DiceGroupResult) -> str:
     """
     将单组骰子的各个骰值格式化为括号列表。
 
-    被丢弃的骰子用圆括号包裹。
-    爆炸追加骰（超出初始数量的部分）附加 '!' 后缀。
+    展示规则：
+      - 被丢弃骰子用圆括号包裹：(1)
+      - 被重骰替换的原始值加波浪线：~2~
+      - 爆炸追加骰加 '!' 后缀（复合爆炸无追加骰概念，跳过）
+      - FATE 骰显示 -/0/+
+      - 成功计数模式：计入成功的骰值加 *，计入失败的加 x
     """
     g = gr.group
+    fate = g.fate
 
-    # 将每个原始骰值归因为"丢弃"或"保留"，尽量保持原始顺序并正确处理重复值。
-
-    display_parts: list[str] = []
-
-    # 爆炸骰组的 all_rolls 列表：基础骰在前，爆炸追加骰在后。
-    # 对爆炸追加骰加 '!' 注释。
     base_count = g.count
     base_rolls = gr.all_rolls[:base_count]
-    extra_rolls = gr.all_rolls[base_count:]  # 爆炸追加骰
+    extra_rolls = gr.all_rolls[base_count:]  # 爆炸追加
 
-    # 用可变计数映射追踪丢弃值的归因。
+    # 被重骰替换值的引用计数
+    rerolled_remaining: dict[int, int] = {}
+    for v in gr.rerolled_originals:
+        rerolled_remaining[v] = rerolled_remaining.get(v, 0) + 1
+
+    # 被丢弃值的引用计数
     dropped_remaining: dict[int, int] = {}
     for v in gr.dropped_rolls:
         dropped_remaining[v] = dropped_remaining.get(v, 0) + 1
 
+    display_parts: list[str] = []
+
     for val in base_rolls:
+        # 先判断是否为被重骰的原始值（展示为波浪线）
+        if rerolled_remaining.get(val, 0) > 0:
+            rerolled_remaining[val] -= 1
+            raw = _fate_str(val) if fate else str(val)
+            display_parts.append(f"~{raw}~")
+            continue
+        raw = _fate_str(val) if fate else str(val)
+        # 成功/失败计数标注
+        if gr.is_success_mode:
+            if g.success_compare and g.success_value is not None:
+                from .dice_roller import _compare  # noqa: PLC0415
+
+                if _compare(val, g.success_compare, g.success_value):
+                    raw = f"{raw}*"
+                elif (
+                    g.failure_compare
+                    and g.failure_value is not None
+                    and _compare(val, g.failure_compare, g.failure_value)
+                ):
+                    raw = f"{raw}x"
         if dropped_remaining.get(val, 0) > 0:
             dropped_remaining[val] -= 1
-            display_parts.append(f"({val})")
+            display_parts.append(f"({raw})")
         else:
-            display_parts.append(str(val))
+            display_parts.append(raw)
 
     for val in extra_rolls:
-        display_parts.append(f"{val}!")
+        raw = _fate_str(val) if fate else str(val)
+        display_parts.append(f"{raw}!")
 
     return "[" + ", ".join(display_parts) + "]"
 
@@ -83,13 +172,13 @@ def _rebuild_expr(result: RollResult) -> str:
     """重建用于显示的紧凑表达式字符串。"""
     parts: list[str] = []
     for i, gr in enumerate(result.group_results):
-        label = _group_label(gr)
+        lbl = _group_label(gr)
         if i == 0 and not gr.negated:
-            parts.append(label.lstrip("+"))
+            parts.append(lbl.lstrip("+"))
         elif gr.negated:
-            parts.append(label)  # _group_label 已带 '-' 前缀
+            parts.append(lbl)  # _group_label 已带 '-' 前缀
         else:
-            parts.append("+" + label)
+            parts.append("+" + lbl)
 
     mod = result.expression.flat_modifier
     if mod > 0:
@@ -110,26 +199,56 @@ def format_result(result: RollResult, show_detail: bool = True) -> str:
     将 RollResult 格式化为单行纯文本字符串。
 
     show_detail=True  → {标签} {表达式}: {骰值列表} = {总计}
-      示例：技能名 2d20: [18, 13] = 31
-            攻击检定 1d20+5: [17] +5 = 22
-            力量 4d6kh3+2: [(1), 3, 5, 6] +2 = 16
-            伤害 2d6+1d4+3: [4, 2] [3] +3 = 12
-
     show_detail=False → {标签} {表达式} = {总计}
+
+    成功计数模式示例：
+      3d6>3: [1, 4*, 5*, 2, 6*] = 3成功
+      3d6>3f1: [1x, 4*, 5*] = 2成功 1失败
     """
     expr_str = _rebuild_expr(result)
     prefix = f"{result.label} {expr_str}" if result.label else expr_str
 
+    # --- 成功计数模式 ---
+    if result.is_success_mode:
+        total_successes = 0
+        total_failures = 0
+        for gr in result.group_results:
+            s = gr.successes or 0
+            f = gr.failures or 0
+            if gr.negated:
+                total_successes -= s - f
+            else:
+                total_successes += s
+                total_failures += f
+
+        if not show_detail:
+            if total_failures:
+                return f"{prefix} = {total_successes}成功 {total_failures}失败"
+            return f"{prefix} = {total_successes}成功"
+
+        dice_parts = [_format_dice_list(gr) for gr in result.group_results]
+        dice_str = " ".join(dice_parts)
+
+        dc = result.expression.dc
+        if dc is not None:
+            net = total_successes - total_failures
+            judge = "成功" if net >= dc else "失败"
+            count_str = f"{total_successes}成功"
+            if total_failures:
+                count_str += f" {total_failures}失败"
+            return f"{prefix}: {dice_str} = {count_str} / {dc} {judge}"
+
+        if total_failures:
+            return f"{prefix}: {dice_str} = {total_successes}成功 {total_failures}失败"
+        return f"{prefix}: {dice_str} = {total_successes}成功"
+
+    # --- 普通求和模式 ---
     if not show_detail:
         return f"{prefix} = {result.total}"
 
-    # 骰值段：每组骰子一个括号列表，中间用空格隔开
-    dice_parts: list[str] = []
-    for gr in result.group_results:
-        dice_parts.append(_format_dice_list(gr))
+    dice_parts = [_format_dice_list(gr) for gr in result.group_results]
     dice_str = " ".join(dice_parts)
 
-    # 平坦修正段（仅在有修正时显示）
     mod = result.expression.flat_modifier
     mod_str = f" +{mod}" if mod > 0 else (f" {mod}" if mod < 0 else "")
 

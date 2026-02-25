@@ -2,13 +2,21 @@
 dice_parser.py — DnD 骰池表达式解析器。
 
 支持语法（大小写不敏感）：
-  基础:           d20, 1d20, 2d6+5, d8-1
-  保留最高/最低:  4d6kh3, 2d20kl1
-  优势/劣势:      d20adv, d20dis  （2d20kh1 / 2d20kl1 的语法糖）
-  爆炸骰:         d6!, 2d10!
-  多骰组:         2d6+1d4+3
-  标签:           1d20+5 攻击检定  或  1d20+5#攻击检定
-  复合修正:       2d6+1d4+3-1d2
+  基础:               d20, 1d20, 2d6+5, d8-1
+  FATE/Fudge 骰:      4dF
+  保留最高/最低:      4d6kh3, 8d100k4, 2d20kl1
+  丢弃最低/最高:      8d6d3 (dl3), 8d6dl3, 8d6dh3
+  优势/劣势:          d20adv, d20dis  （2d20kh1 / 2d20kl1 的语法糖）
+  标准爆炸骰:         d6!, 2d10!>4 (>=4 爆炸), d6!3 (=3 爆炸)
+  复合爆炸骰:         5d6!! (Shadowrun 风格)
+  穿透爆炸骰:         5d6!p (HackMaster 风格)
+  目标数成功计数:     3d6>3, 10d6<4
+  失败计数附加:       3d6>3f1, 10d6<4f>5
+  重骰:               2d8r<2, 8d6r, 2d6ro<2 (只重骰一次)
+  排序:               8d6s (升序), 8d6sd (降序)
+  多骰组:             2d6+1d4+3
+  标签:               1d20+5 攻击检定  或  1d20+5#攻击检定
+  复合修正:           2d6+1d4+3-1d2
 """
 
 from __future__ import annotations
@@ -31,15 +39,41 @@ class DiceParseError(ValueError):
 
 
 @dataclass
+class RerollCondition:
+    """单条重骰条件，例如 r<2 或 ro=1。"""
+
+    compare: str  # ">" / "<" / "="
+    value: int
+    once: bool = False  # True = ro（只重骰一次），False = r（循环）
+
+
+@dataclass
 class DiceGroup:
     """单组骰子，例如 4d6kh3 或 d20!。"""
 
     count: int  # 骰子数量
-    sides: int  # 每个骰子的面数
+    sides: int  # 每个骰子的面数（0 代表 FATE 骰）
+    fate: bool = False  # 是否为 FATE/Fudge 骰（dF）
     keep_mode: str | None = None  # "kh"（保留最高）或 "kl"（保留最低）
     keep_n: int | None = None  # 保留几个
+    drop_mode: str | None = None  # "dl"（丢弃最低）或 "dh"（丢弃最高）
+    drop_n: int | None = None  # 丢弃几个
+    # --- 爆炸相关 ---
     exploding: bool = False  # 是否为爆炸骰
-    modifier: int = 0  # 每组的附加平坦修正，通常为 0
+    explode_mode: str = "standard"  # "standard"(!), "compound"(!!), "penetrate"(!p)
+    explode_compare: str | None = None  # ">" / "<" / "=" (None = 等于最大值)
+    explode_value: int | None = None  # 自定义爆炸阈值
+    # --- 成功/失败计数 ---
+    success_compare: str | None = None  # ">" / "<" / "="
+    success_value: int | None = None
+    failure_compare: str | None = None  # ">" / "<" / "="
+    failure_value: int | None = None
+    # --- 重骰 ---
+    reroll_conditions: list = field(default_factory=list)  # list[RerollCondition]
+    # --- 排序 ---
+    sort_order: str | None = None  # "asc" / "desc"
+    # --- 符号哨兵（内部使用）---
+    modifier: int = 0  # -1 = 哨兵：该组取反
 
 
 @dataclass
@@ -53,19 +87,202 @@ class ParsedExpression:
 
 
 # ---------------------------------------------------------------------------
-# 词法分析器
+# 词法分析助手
 # ---------------------------------------------------------------------------
-
-# 单个骰子 token：[count]d<sides>[adv|dis|kh<n>|kl<n>][!]
-_DICE_TOKEN_RE = re.compile(
-    r"(?P<count>\d+)?d(?P<sides>\d+)"
-    r"(?P<special>adv|dis|kh\d+|kl\d+)?"
-    r"(?P<exploding>!)?",
-    re.IGNORECASE,
-)
 
 # 平坦整数 token（用于位置感知匹配）
 _INT_TOKEN_RE = re.compile(r"\d+")
+
+
+def _read_int(s: str, pos: int) -> tuple[int | None, int]:
+    """尝试在 pos 处读取非负整数，返回 (value, new_pos) 或 (None, pos)。"""
+    m = _INT_TOKEN_RE.match(s, pos)
+    if m:
+        return int(m.group(0)), m.end()
+    return None, pos
+
+
+def _read_compare_point(s: str, pos: int) -> tuple[str | None, int | None, int]:
+    """
+    读取可选的比较点（ComparePoint）：[>|<|=]N 或 仅 N（默认 =）。
+    返回 (compare_op, value, new_pos)；若无有效数字则返回 (None, None, pos)。
+    """
+    if pos >= len(s):
+        return None, None, pos
+    compare = "="
+    if s[pos] in (">", "<", "="):
+        compare = s[pos]
+        pos += 1
+    val, new_pos = _read_int(s, pos)
+    if val is None:
+        # 消耗了比较符但没有数字 → 回退
+        if compare != "=":
+            return None, None, pos - 1
+        return None, None, pos
+    return compare, val, new_pos
+
+
+def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
+    """
+    从 expr[pos] 起尝试解析一个骰子 token。
+
+    返回 (DiceGroup, new_pos) 或 (None, pos)（未能匹配时）。
+    """
+    start = pos
+    n = len(expr)
+
+    # 1. 可选骰子数量
+    count_val, pos = _read_int(expr, pos)
+
+    # 2. 'D' 或 'd'
+    if pos >= n or expr[pos].lower() != "d":
+        return None, start
+
+    pos += 1  # 消耗 'd'
+
+    # 3. 骰面：'F'/'f' = FATE，否则整数
+    fate = False
+    sides = 0
+    if pos < n and expr[pos].lower() == "f":
+        # 确保 F 后面不是数字（否则可能是 d4f1 这样的失败修饰）
+        # 实际上 dF 的 F 必须紧跟骰面位置，所以这里优先判断
+        fate = True
+        sides = 0
+        pos += 1
+    else:
+        sides_val, pos2 = _read_int(expr, pos)
+        if sides_val is None:
+            # 'd' 后面没有数字 → 无法解析
+            return None, start
+        sides = sides_val
+        pos = pos2
+
+    count = count_val if count_val is not None else 1
+    group = DiceGroup(count=count, sides=sides, fate=fate)
+
+    # 4. 保留/丢弃修饰（优先于爆炸，顺序：kh/kl/k、dh/dl/d）
+    #    注意："d" 是丢弃简写，但要先检查后面是否有 h/l 区分 dh/dl
+    #    另需避免与骰子数量的 'd' 混淆 → 只有已成功匹配骰子后才匹配
+    if pos < n:
+        ch = expr[pos].lower()
+        # keep
+        if ch == "k":
+            pos += 1
+            if pos < n and expr[pos].lower() == "h":
+                pos += 1
+                kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.keep_mode = "kh"
+                group.keep_n = kn if kn is not None else 1
+            elif pos < n and expr[pos].lower() == "l":
+                pos += 1
+                kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.keep_mode = "kl"
+                group.keep_n = kn if kn is not None else 1
+            else:
+                # 'k' 单独 = kh
+                kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.keep_mode = "kh"
+                group.keep_n = kn if kn is not None else 1
+        elif ch == "d":
+            # 丢弃：需要 dl/dh/d(数字) 三种情况
+            # 避免误把下一骰组的 'd' 消耗掉：必须有 h/l 或紧跟数字
+            peek = pos + 1
+            if peek < n and expr[peek].lower() == "h":
+                pos += 2  # consume 'd' + 'h'
+                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.drop_mode = "dh"
+                group.drop_n = dn if dn is not None else 1
+            elif peek < n and expr[peek].lower() == "l":
+                pos += 2  # consume 'd' + 'l'
+                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.drop_mode = "dl"
+                group.drop_n = dn if dn is not None else 1
+            elif peek < n and expr[peek].isdigit():
+                pos += 1  # consume 'd'
+                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.drop_mode = "dl"  # 'd' 简写 = dl（丢弃最低，与 Roll20 一致）
+                group.drop_n = dn if dn is not None else 1
+            # else: 不是丢弃修饰，可能是下一骰组的开始 → 不消耗
+        # adv / dis 语法糖
+        elif expr[pos : pos + 3].lower() == "adv":
+            group.count = 2
+            group.keep_mode = "kh"
+            group.keep_n = 1
+            pos += 3
+        elif expr[pos : pos + 3].lower() == "dis":
+            group.count = 2
+            group.keep_mode = "kl"
+            group.keep_n = 1
+            pos += 3
+
+    # 5. 爆炸修饰：!! > !p > !
+    if pos < n and expr[pos] == "!":
+        group.exploding = True
+        pos += 1
+        if pos < n and expr[pos] == "!":
+            group.explode_mode = "compound"
+            pos += 1
+        elif pos < n and expr[pos].lower() == "p":
+            group.explode_mode = "penetrate"
+            pos += 1
+        else:
+            group.explode_mode = "standard"
+        # 可选自定义爆炸 ComparePoint
+        if pos < n and (expr[pos] in (">", "<", "=") or expr[pos].isdigit()):
+            cmp, val, pos = _read_compare_point(expr, pos)
+            group.explode_compare = cmp
+            group.explode_value = val
+
+    # 6. 成功计数 ComparePoint（>N 或 <N）
+    if pos < n and expr[pos] in (">", "<"):
+        cmp, val, new_pos = _read_compare_point(expr, pos)
+        if val is not None:
+            group.success_compare = cmp
+            group.success_value = val
+            pos = new_pos
+
+            # 6a. 失败计数（f[>|<|=]N）
+            if pos < n and expr[pos].lower() == "f":
+                pos += 1
+                f_cmp, f_val, new_pos2 = _read_compare_point(expr, pos)
+                if f_val is not None:
+                    group.failure_compare = f_cmp
+                    group.failure_value = f_val
+                    pos = new_pos2
+                else:
+                    # 'f' 后没有数字 → 退回
+                    pos -= 1
+
+    # 7. 重骰修饰（r / ro，可重复）
+    while pos < n and expr[pos].lower() == "r":
+        once = False
+        pos += 1
+        if pos < n and expr[pos].lower() == "o":
+            once = True
+            pos += 1
+        cmp, val, new_pos = _read_compare_point(expr, pos)
+        if val is None:
+            # 'r' 后无 ComparePoint → 默认 =1（重骰 1）
+            cmp, val = "=", 1
+        else:
+            pos = new_pos
+        group.reroll_conditions.append(
+            RerollCondition(compare=cmp, value=val, once=once)
+        )
+
+    # 8. 排序修饰（s / sa / sd）
+    if pos < n and expr[pos].lower() == "s":
+        pos += 1
+        if pos < n and expr[pos].lower() == "d":
+            group.sort_order = "desc"
+            pos += 1
+        elif pos < n and expr[pos].lower() == "a":
+            group.sort_order = "asc"
+            pos += 1
+        else:
+            group.sort_order = "asc"  # 默认升序
+
+    return group, pos
 
 
 def _strip_label(raw: str) -> tuple[str, str]:
@@ -89,8 +306,9 @@ def _strip_label(raw: str) -> tuple[str, str]:
         return parts[0].strip(), parts[1].strip()
 
     # 从起始处匹配骰子表达式字符集（不含空格，空格视为分隔符）。
-    # 字符集：数字、d/D、k/K、h/H、l/L、+、-、!、a/A、v/V、i/I、s/S（adv/dis）。
-    m = re.match(r"^([\ddDkKhHlL+\-!aAvViIsS]+)(.*)", raw, re.DOTALL)
+    # 字符集：数字、d/D、k/K、h/H、l/L、+、-、!、a/A、v/V、i/I、
+    #          s/S（sort/adv/dis）、>、<、=、f/F（failure）、r/R（reroll）、o/O（ro）、p/P（penetrate）
+    m = re.match(r"^([\ddDkKhHlL+\-!aAvViIsS><>=fFrRoOpP]+)(.*)", raw, re.DOTALL)
     if m and m.group(1):
         return m.group(1).strip(), m.group(2).strip()
 
@@ -139,8 +357,7 @@ def parse(raw: str) -> ParsedExpression:
     found_any = False
 
     while pos < len(expr_str):
-        # 尝试在当前位置匹配一组骰子。
-        # 多骰组时，骰子组前可有可选的 +/- 符号。
+        # 处理可选 +/- 符号
         sign = 1
         if expr_str[pos] in ("+", "-"):
             sign = 1 if expr_str[pos] == "+" else -1
@@ -148,48 +365,15 @@ def parse(raw: str) -> ParsedExpression:
             if pos >= len(expr_str):
                 raise DiceParseError(f"表达式末尾不能是运算符: '{raw}'")
 
-        m = _DICE_TOKEN_RE.match(expr_str, pos)
-        if m:
+        group, new_pos = _parse_dice_token(expr_str, pos)
+        if group is not None:
             found_any = True
-            count_s = m.group("count")
-            count = int(count_s) if count_s else 1
-            sides = int(m.group("sides"))
-
-            special = (m.group("special") or "").lower()
-            exploding = bool(m.group("exploding"))
-            keep_mode: str | None = None
-            keep_n: int | None = None
-
-            if special == "adv":
-                count = 2
-                keep_mode = "kh"
-                keep_n = 1
-            elif special == "dis":
-                count = 2
-                keep_mode = "kl"
-                keep_n = 1
-            elif special.startswith("kh"):
-                keep_mode = "kh"
-                keep_n = int(special[2:])
-            elif special.startswith("kl"):
-                keep_mode = "kl"
-                keep_n = int(special[2:])
-
-            group = DiceGroup(
-                count=count,
-                sides=sides,
-                keep_mode=keep_mode,
-                keep_n=keep_n,
-                exploding=exploding,
-            )
-            # 负号骰子组：通过 modifier 哨兵值记录符号，执行器中取反小计。
             if sign == -1:
                 group.modifier = -1  # 哨兵值：执行器将对小计取反
             groups.append(group)
-            pos = m.end()
+            pos = new_pos
         else:
             # 尝试匹配平坦整数修正值。
-            # +/- 符号已消耗并存储在 `sign` 中。
             m2 = _INT_TOKEN_RE.match(expr_str, pos)
             if m2:
                 found_any = True
@@ -198,18 +382,14 @@ def parse(raw: str) -> ParsedExpression:
             else:
                 raise DiceParseError(
                     f"无法解析骰池表达式中的 '{expr_str[pos:]}' (完整输入: '{raw}')\n"
-                    "示例语法: d20, 1d20+5, 4d6kh3, d20adv, d6!, 2d6+1d4+3"
+                    "示例语法: d20, 1d20+5, 4d6kh3, d20adv, d6!, 3d6>3, 2d8r<2, 4dF"
                 )
 
     if not found_any:
         raise DiceParseError(
             f"输入中未找到有效的骰池表达式: '{raw}'\n"
-            "示例语法: d20, 1d20+5, 4d6kh3, d20adv, d6!, 2d6+1d4+3"
+            "示例语法: d20, 1d20+5, 4d6kh3, d20adv, d6!, 3d6>3, 2d8r<2, 4dF"
         )
-
-    if not groups:
-        # 仅有平坦修正值，无骰子组——仍为合法输入。
-        pass
 
     return ParsedExpression(
         groups=groups, flat_modifier=flat_modifier, label=label, dc=dc
