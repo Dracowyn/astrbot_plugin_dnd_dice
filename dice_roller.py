@@ -96,13 +96,19 @@ class RollResult:
 
     @property
     def is_natural_1(self) -> bool:
-        """单枚 d20（非劣势）掷出 1 时为 True。"""
+        """单枚 d20 掷出 1 时为 True，含优势（kh）和劣势（kl）场景。"""
         for r in self.group_results:
             g = r.group
             if g.sides == 20 and g.keep_mode is None and g.count == 1:
                 if r.kept_rolls and r.kept_rolls[0] == 1:
                     return True
-            if g.sides == 20 and g.keep_mode == "kh" and g.count == 2 and g.keep_n == 1:
+            # 优势（kh）和劣势（kl）——保留骰为 1 均触发"大失败"
+            if (
+                g.sides == 20
+                and g.keep_mode in ("kh", "kl")
+                and g.count == 2
+                and g.keep_n == 1
+            ):
                 if r.kept_rolls and r.kept_rolls[0] == 1:
                     return True
         return False
@@ -158,7 +164,10 @@ def _roll_fate() -> int:
 
 
 def _roll_standard_exploding(sides: int, group: DiceGroup, max_depth: int) -> list[int]:
-    """标准爆炸：每个骰子独立爆炸，返回该骰子的所有值（首值 + 爆炸追加值）。"""
+    """标准爆炸：每个骰子独立爆炸，返回该骰子的所有值（首值 + 爆炸追加值）。
+
+    Note: not called by _roll_group (inlined). Kept for external/testing use.
+    """
     results: list[int] = []
     depth = 0
     val = _roll_single(sides)
@@ -186,7 +195,10 @@ def _roll_compound_exploding(sides: int, group: DiceGroup, max_depth: int) -> in
 def _roll_penetrating_exploding(
     sides: int, group: DiceGroup, max_depth: int
 ) -> list[int]:
-    """穿透爆炸（HackMaster 风格）：每次追加骰减 1，返回所有骰值（含追加）。"""
+    """穿透爆炸（HackMaster 风格）：每次追加骰减 1，返回所有骰值（含追加）。
+
+    Note: not called by _roll_group (inlined). Kept for external/testing use.
+    """
     results: list[int] = []
     depth = 0
     val = _roll_single(sides)
@@ -221,11 +233,9 @@ def _apply_rerolls(
 
     for val in raw_rolls:
         original = val
-        replaced = False
 
         for cond in conditions:
             if _compare(val, cond.compare, cond.value):
-                replaced = True
                 rerolled.append(original)
                 if cond.once:
                     # ro：只重骰一次
@@ -238,8 +248,6 @@ def _apply_rerolls(
                         depth += 1
                 break  # 一个骰值只触发第一个匹配的条件
 
-        if replaced and original not in rerolled:
-            rerolled.append(original)
         final.append(val)
 
     return final, rerolled
@@ -251,7 +259,11 @@ def _apply_rerolls(
 
 
 def _roll_group(
-    group: DiceGroup, max_dice: int, max_sides: int, exploding_depth: int
+    group: DiceGroup,
+    max_dice: int,
+    max_sides: int,
+    exploding_depth: int,
+    reroll_max_depth: int = 20,
 ) -> DiceGroupResult:
     """掷一组骰子并返回结果。"""
     if group.count > max_dice:
@@ -265,55 +277,70 @@ def _roll_group(
 
     negated = group.modifier == -1
     exploded_extra: list[int] = []
-    raw_rolls: list[int] = []
     sides = group.sides
 
-    # --- 1. 基础掷骰 ---
+    # --- 1. 基础掷骰（复合爆炸原子化；其他模式仅掷基础骰，爆炸在重骰后应用）---
     if group.fate:
         # FATE/Fudge 骰：三面 -1/0/1
         raw_rolls = [_roll_fate() for _ in range(group.count)]
-        all_rolls = list(raw_rolls)
-    elif group.exploding:
-        if group.explode_mode == "compound":
-            # 复合爆炸：每骰返回合并值（单个整数）
-            raw_rolls = [
-                _roll_compound_exploding(sides, group, exploding_depth)
-                for _ in range(group.count)
-            ]
-            all_rolls = list(raw_rolls)
-        elif group.explode_mode == "penetrate":
-            # 穿透爆炸：返回骰子链
-            for _ in range(group.count):
-                chain = _roll_penetrating_exploding(sides, group, exploding_depth)
-                raw_rolls.append(chain[0])
-                exploded_extra.extend(chain[1:])
-            all_rolls = raw_rolls + exploded_extra
-        else:
-            # 标准爆炸
-            for _ in range(group.count):
-                chain = _roll_standard_exploding(sides, group, exploding_depth)
-                raw_rolls.append(chain[0])
-                exploded_extra.extend(chain[1:])
-            all_rolls = raw_rolls + exploded_extra
+    elif group.exploding and group.explode_mode == "compound":
+        # 复合爆炸：整条链返回单值，不存在"先重骰再爆炸"的分离需求
+        raw_rolls = [
+            _roll_compound_exploding(sides, group, exploding_depth)
+            for _ in range(group.count)
+        ]
     else:
+        # 标准/穿透爆炸或普通骰：仅掷基础值，爆炸追加在重骰完成后处理
         raw_rolls = [_roll_single(sides) for _ in range(group.count)]
-        all_rolls = list(raw_rolls)
 
-    # --- 2. 重骰 ---
+    # --- 2. 重骰（在爆炸之前应用，reroll_max_depth 独立于 exploding_depth）---
     rerolled_originals: list[int] = []
     if group.reroll_conditions:
-        # 重骰只作用于初始骰（raw_rolls），不含爆炸追加骰
         effective_sides = sides if not group.fate else 0
         raw_rolls, rerolled_originals = _apply_rerolls(
             raw_rolls,
             effective_sides,
             group.reroll_conditions,
-            exploding_depth,
+            reroll_max_depth,
             group.fate,
         )
-        all_rolls = raw_rolls + exploded_extra
 
-    # --- 3. Keep / Drop 过滤 ---
+    # --- 3. 重骰完成后应用爆炸（复合爆炸和 FATE 骰无此阶段）---
+    if group.exploding and not group.fate and group.explode_mode != "compound":
+        exploded_extra = []
+        if group.explode_mode == "penetrate":
+            for v in raw_rolls:
+                depth = 0
+                curr = v
+                while _should_explode(curr, sides, group) and depth < exploding_depth:
+                    depth += 1
+                    curr = max(1, _roll_single(sides) - 1)
+                    exploded_extra.append(curr)
+        else:  # standard
+            for v in raw_rolls:
+                depth = 0
+                curr = v
+                while _should_explode(curr, sides, group) and depth < exploding_depth:
+                    depth += 1
+                    curr = _roll_single(sides)
+                    exploded_extra.append(curr)
+
+        # --- 3a. 对爆炸追加骰也应用重骰规则（Roll20 规范：重骰作用于所有已落定的骰子）---
+        # 追加骰不再触发二次爆炸（pragmatic limit，避免无限递归）
+        if group.reroll_conditions and exploded_extra:
+            extra_effective_sides = sides if not group.fate else 0
+            exploded_extra, extra_rerolled = _apply_rerolls(
+                exploded_extra,
+                extra_effective_sides,
+                group.reroll_conditions,
+                reroll_max_depth,
+                group.fate,
+            )
+            rerolled_originals.extend(extra_rerolled)
+
+    all_rolls = raw_rolls + exploded_extra
+
+    # --- 4. Keep / Drop 过滤 ---
     # 先把 drop 路径转换为等价的 keep 路径再统一处理
     effective_keep_mode = group.keep_mode
     effective_keep_n = group.keep_n
@@ -353,7 +380,7 @@ def _roll_group(
         kept_vals = list(all_rolls)
         dropped_vals = []
 
-    # --- 4. 排序（仅影响展示顺序）---
+    # --- 5. 排序（仅影响展示顺序）---
     if group.sort_order == "asc":
         kept_vals = sorted(kept_vals)
     elif group.sort_order == "desc":
@@ -367,7 +394,7 @@ def _roll_group(
             kept_vals + dropped_sorted, reverse=(group.sort_order == "desc")
         )
 
-    # --- 5. 成功/失败计数 ---
+    # --- 6. 成功/失败计数 ---
     successes: int | None = None
     failures: int | None = None
     if group.success_compare is not None and group.success_value is not None:
@@ -406,6 +433,7 @@ def roll(
     max_dice: int = 100,
     max_sides: int = 1000,
     exploding_depth: int = 20,
+    reroll_max_depth: int = 20,
 ) -> RollResult:
     """
     执行 ParsedExpression 并返回 RollResult。
@@ -414,6 +442,6 @@ def roll(
     """
     result = RollResult(expression=expr)
     for group in expr.groups:
-        gr = _roll_group(group, max_dice, max_sides, exploding_depth)
+        gr = _roll_group(group, max_dice, max_sides, exploding_depth, reroll_max_depth)
         result.group_results.append(gr)
     return result
