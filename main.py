@@ -292,11 +292,13 @@ class DnDDicePlugin(Star):
             current = await self._get_effective_sides(event)
             key = f"session_sides:{event.unified_msg_origin}"
             is_session_set = await self.get_kv_data(key, None) is not None
-            source = "会话设置" if is_session_set else "全局默认"
+            source = "会话设置" if is_session_set else "默认"
             yield event.plain_result(
                 f"当前默认骰面数: d{current}（{source}）\n"
-                f"全局默认: d{self.default_dice_sides}\n"
-                f"用法: /dset <面数> | /dset reset"
+                # f"全局默认: d{self.default_dice_sides}\n"
+                f"用法: /dset <面数>\n"
+                f"示例: /dset 6\n"
+                f"重置: /dset reset\n"
             )
             return
 
