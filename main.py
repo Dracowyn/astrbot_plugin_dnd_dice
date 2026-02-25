@@ -135,6 +135,22 @@ class DnDDicePlugin(Star):
         )
         self.show_detail: bool = _safe_bool(cfg.get("show_detail"), True)
 
+        # 骰面大小配置
+        self.default_dice_sides: int = _safe_int(
+            cfg.get("default_dice_sides"), 20, min_val=2
+        )
+        self.allow_session_dice_sides: bool = _safe_bool(
+            cfg.get("allow_session_dice_sides"), True
+        )
+        self.enable_whitelist: bool = _safe_bool(cfg.get("enable_whitelist"), False)
+        raw_whitelist = cfg.get("whitelist_users") or []
+        self.whitelist_users: list[str] = (
+            [str(u) for u in raw_whitelist] if isinstance(raw_whitelist, list) else []
+        )
+        self.allow_private_bypass_whitelist: bool = _safe_bool(
+            cfg.get("allow_private_bypass_whitelist"), True
+        )
+
         # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
         self._character_manager: CharacterManager | None = None
 
@@ -149,21 +165,63 @@ class DnDDicePlugin(Star):
         logger.info(
             "[dnd_dice] DnD D20 骰子插件已加载。"
             f"限制: 最多骰子数={self.max_dice_count}, 最大面数={self.max_dice_sides}, "
-            f"爆炸深度={self.exploding_max_depth}, 显示明细={self.show_detail}"
+            f"爆炸深度={self.exploding_max_depth}, 显示明细={self.show_detail}, "
+            f"默认骰面={self.default_dice_sides}, 允许会话设置={self.allow_session_dice_sides}"
         )
+
+    # ------------------------------------------------------------------
+    # 骰面大小辅助方法
+    # ------------------------------------------------------------------
+
+    async def _get_effective_sides(self, event: AstrMessageEvent) -> int:
+        """
+        获取当前会话的有效默认骰面数。
+
+        优先使用会话级设置（通过 /dset 命令设置），不存在则回退到全局默认值。
+        """
+        key = f"session_sides:{event.unified_msg_origin}"
+        sides = await self.get_kv_data(key, self.default_dice_sides)
+        return _safe_int(sides, self.default_dice_sides, min_val=2)
+
+    async def _check_permission(self, event: AstrMessageEvent) -> bool:
+        """
+        检查当前用户是否有权使用 /dset 命令。
+
+        判断顺序：
+        1. allow_session_dice_sides 为 False → 始终拒绝
+        2. enable_whitelist 为 False → 始终允许
+        3. 私聊且 allow_private_bypass_whitelist → 允许
+        4. whitelist_users 非空 → 检查 sender_id 是否在列表中
+        5. whitelist_users 为空 → 使用 AstrBot 管理员判断
+        """
+        if not self.allow_session_dice_sides:
+            return False
+        if not self.enable_whitelist:
+            return True
+        if self.allow_private_bypass_whitelist and event.is_private_chat():
+            return True
+        sender_id = str(event.get_sender_id())
+        if self.whitelist_users:
+            return sender_id in self.whitelist_users
+        # 白名单为空，回退到 AstrBot 全局管理员
+        return event.is_admin()
 
     # ------------------------------------------------------------------
     # 内部辅助方法
     # ------------------------------------------------------------------
 
-    def _do_roll(self, expression_str: str) -> str:
+    def _do_roll(self, expression_str: str, default_sides: int = 20) -> str:
         """
         解析、执行并格式化一条骰池表达式。
 
         返回纯文本结果字符串，所有异常均被捕获并转换为可读错误信息。
+
+        Args:
+            expression_str: 骰池表达式字符串。
+            default_sides: 空表达式时使用的默认骰面数。
         """
         try:
-            expr = parse(expression_str)
+            expr = parse(expression_str, default_sides=default_sides)
         except DiceParseError as e:
             return f"解析错误: {e}\n{_SYNTAX_HELP}"
 
@@ -181,7 +239,7 @@ class DnDDicePlugin(Star):
             return format_result(result, show_detail=self.show_detail)
         except Exception as e:  # noqa: BLE001
             logger.exception(f"[dnd_dice] 格式化结果时发生意外错误: {e}")
-            return f"掷骰完成，但系统内部错误"
+            return "掷骰完成，但系统内部错误"
 
     # ------------------------------------------------------------------
     # /r 指令处理器
@@ -202,16 +260,92 @@ class DnDDicePlugin(Star):
         parts = raw_msg.split(None, 1)  # 按第一个空白字符分割
         expression_str = parts[1].strip() if len(parts) > 1 else ""
 
-        # 无参数时默认掷一个 d20
-        if not expression_str:
-            expression_str = "d20"
+        effective_sides = await self._get_effective_sides(event)
 
-        output = self._do_roll(expression_str)
+        # 无参数时默认掷一个 dN（N 为会话/全局默认骰面数）
+        if not expression_str:
+            expression_str = f"d{effective_sides}"
+
+        output = self._do_roll(expression_str, default_sides=effective_sides)
         yield event.plain_result(output)
 
     # ------------------------------------------------------------------
     # LLM 函数工具
     # ------------------------------------------------------------------
+
+    @filter.command("dset", alias={"dice_set"})
+    async def dset_cmd(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """
+        设置当前会话的默认骰面数。
+
+        用法:
+          /dset <面数>     将当前会话默认骰面数设为指定值
+          /dset reset     清除会话设置，恢复为全局默认
+          /dset           查看当前会话的默认骰面数
+        """
+        raw_msg: str = event.message_str.strip()
+        parts = raw_msg.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        # 查询当前设置
+        if not arg:
+            current = await self._get_effective_sides(event)
+            key = f"session_sides:{event.unified_msg_origin}"
+            is_session_set = await self.get_kv_data(key, None) is not None
+            source = "会话设置" if is_session_set else "全局默认"
+            yield event.plain_result(
+                f"当前默认骰面数: d{current}（{source}）\n"
+                f"全局默认: d{self.default_dice_sides}\n"
+                f"用法: /dset <面数> | /dset reset"
+            )
+            return
+
+        # 权限检查
+        if not await self._check_permission(event):
+            if not self.allow_session_dice_sides:
+                yield event.plain_result("管理员已禁用会话骰面设置功能。")
+            else:
+                yield event.plain_result(
+                    "你没有权限使用此命令。"
+                    + (
+                        "（白名单模式已启用，请联系管理员）"
+                        if self.enable_whitelist
+                        else ""
+                    )
+                )
+            return
+
+        key = f"session_sides:{event.unified_msg_origin}"
+
+        # 重置会话设置
+        if arg.lower() in ("reset", "重置", "0"):
+            await self.delete_kv_data(key)
+            yield event.plain_result(
+                f"已清除骰面设置，恢复为默认 d{self.default_dice_sides}。"
+            )
+            return
+
+        # 解析并验证面数
+        try:
+            new_sides = int(arg)
+        except ValueError:
+            yield event.plain_result(
+                f"无效的面数: '{arg}'，请输入 2~{self.max_dice_sides} 之间的整数，或 reset 重置。"
+            )
+            return
+
+        if new_sides < 2:
+            yield event.plain_result("骰面数不能小于 2。")
+            return
+        if new_sides > self.max_dice_sides:
+            yield event.plain_result(f"骰面数不能超过限制 {self.max_dice_sides}。")
+            return
+
+        await self.put_kv_data(key, new_sides)
+        yield event.plain_result(
+            f"已将当前默认骰面数设为 d{new_sides}。"
+            f"后续 /r 将默认投掷 d{new_sides}。"
+        )
 
     @filter.llm_tool(name="roll_dice")
     async def roll_dice_tool(
@@ -254,7 +388,8 @@ class DnDDicePlugin(Star):
         else:
             full_expr = expression
 
-        output = self._do_roll(full_expr)
+        effective_sides = await self._get_effective_sides(event)
+        output = self._do_roll(full_expr, default_sides=effective_sides)
 
         # 将结果返回给 LLM，由 LLM 将骰点结果融入叙事后回复用户。
         return output

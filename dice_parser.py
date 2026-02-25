@@ -322,11 +322,15 @@ def _strip_label(raw: str) -> tuple[str, str]:
     return raw, ""
 
 
-def parse(raw: str) -> ParsedExpression:
+def parse(raw: str, default_sides: int = 20) -> ParsedExpression:
     """
     将原始骰池表达式字符串解析为 ParsedExpression。
 
     表达式无效或为空时抛出 DiceParseError。
+
+    Args:
+        raw: 原始骰池表达式字符串。
+        default_sides: 无参数时使用的默认骰面数，默认为 20（d20）。
     """
     _MAX_INPUT_LEN = 200
     if raw and len(raw) > _MAX_INPUT_LEN:
@@ -335,9 +339,9 @@ def parse(raw: str) -> ParsedExpression:
         )
 
     if not raw or not raw.strip():
-        # 默认：单个 d20
+        # 默认：单个 dN（N 由调用方指定，通常为 20）
         return ParsedExpression(
-            groups=[DiceGroup(count=1, sides=20)], flat_modifier=0, label=""
+            groups=[DiceGroup(count=1, sides=default_sides)], flat_modifier=0, label=""
         )
 
     expr_str, label = _strip_label(raw.strip())

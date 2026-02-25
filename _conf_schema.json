@@ -37,5 +37,40 @@
         "hint": "开启后每次投掷都会显示每个骰子的具体点数",
         "type": "bool",
         "default": true
+    },
+    "default_dice_sides": {
+        "description": "全局默认骰子面数",
+        "hint": "无参数执行 /r 时使用的默认骰面数，例如设为 6 则 /r 等价于 /r d6",
+        "type": "int",
+        "default": 20,
+        "slider": {
+            "min": 2,
+            "max": 10000,
+            "step": 1
+        }
+    },
+    "allow_session_dice_sides": {
+        "description": "允许通过命令设置会话骰面数",
+        "hint": "启用后，用户可使用 /dset <面数> 为当前会话设置独立的默认骰面数",
+        "type": "bool",
+        "default": true
+    },
+    "enable_whitelist": {
+        "description": "启用白名单模式",
+        "hint": "启用后，只有白名单用户（或管理员）才能使用 /dset 命令",
+        "type": "bool",
+        "default": false
+    },
+    "whitelist_users": {
+        "description": "白名单用户 ID 列表",
+        "hint": "允许使用 /dset 命令的用户 ID，留空则使用 AstrBot 配置的管理员 ID",
+        "type": "list",
+        "default": []
+    },
+    "allow_private_bypass_whitelist": {
+        "description": "私聊不受白名单限制",
+        "hint": "启用后，私聊会话中的用户无需在白名单中即可使用 /dset 命令",
+        "type": "bool",
+        "default": true
     }
 }
