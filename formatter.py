@@ -15,7 +15,7 @@ formatter.py — DnD 骰点结果的纯文本格式化器。
 
 from __future__ import annotations
 
-from .dice_roller import DiceGroupResult, RollResult
+from .dice_roller import DiceGroupResult, RollResult, _compare
 
 # ---------------------------------------------------------------------------
 # FATE 骰值映射
@@ -145,8 +145,6 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
         # 成功/失败计数标注
         if gr.is_success_mode:
             if g.success_compare and g.success_value is not None:
-                from .dice_roller import _compare  # noqa: PLC0415
-
                 if _compare(val, g.success_compare, g.success_value):
                     raw = f"{raw}*"
                 elif (
@@ -216,7 +214,9 @@ def format_result(result: RollResult, show_detail: bool = True) -> str:
             s = gr.successes or 0
             f = gr.failures or 0
             if gr.negated:
-                total_successes -= s - f
+                # 负号组：将两个计数器各自减去本组值，保持净值与 subtotal 一致
+                total_successes -= s
+                total_failures -= f
             else:
                 total_successes += s
                 total_failures += f

@@ -69,7 +69,7 @@ class DiceGroup:
     failure_compare: str | None = None  # ">" / "<" / "="
     failure_value: int | None = None
     # --- 重骰 ---
-    reroll_conditions: list = field(default_factory=list)  # list[RerollCondition]
+    reroll_conditions: list[RerollCondition] = field(default_factory=list)
     # --- 排序 ---
     sort_order: str | None = None  # "asc" / "desc"
     # --- 符号哨兵（内部使用）---
@@ -289,29 +289,34 @@ def _strip_label(raw: str) -> tuple[str, str]:
     """
     从原始输入中分离表达式部分与可选标签。
 
-    策略：从字符串起始处贪婪匹配骰子表达式字符集，
-    遇到第一个非表达式字符（中文、字母标签等）即截断。
-    支持有空格和无空格两种写法，例如：
-      'd20 技能名 10'  →  ('d20', '技能名 10')
-      'd20技能名10'   →  ('d20', '技能名10')
-    '#' 为强制分隔符，优先处理。
+    分離策略（优先级从高到低）：
+      1. '#' 强制分隔符，优先处理。
+      2. 以第一个空白字符切分——兼容『d20 技能名 15』。
+      3. 如果无空格、无 '#'，且包含非 ASCII 字符（如中文），
+         则在首个非 ASCII 字符处截断——兼容『d20技能名10』。
+      4. 纯 ASCII 且无分隔符：整体作为表达式，无标签。
+         ASCII 标签必须通过 '#' 或空格显式分隔。
 
     返回 (expression_part, label_part)。
     """
     raw = raw.strip()
 
-    # 优先处理 '#' 强制分隔符。
+    # 1. '#' 强制分隔符。
     if "#" in raw:
         parts = raw.split("#", 1)
         return parts[0].strip(), parts[1].strip()
 
-    # 从起始处匹配骰子表达式字符集（不含空格，空格视为分隔符）。
-    # 字符集：数字、d/D、k/K、h/H、l/L、+、-、!、a/A、v/V、i/I、
-    #          s/S（sort/adv/dis）、>、<、=、f/F（failure）、r/R（reroll）、o/O（ro）、p/P（penetrate）
-    m = re.match(r"^([\ddDkKhHlL+\-!aAvViIsS><>=fFrRoOpP]+)(.*)", raw, re.DOTALL)
-    if m and m.group(1):
-        return m.group(1).strip(), m.group(2).strip()
+    # 2. 以第一个空白字符切分。
+    ws_match = re.search(r"\s", raw)
+    if ws_match:
+        return raw[: ws_match.start()].strip(), raw[ws_match.start() :].strip()
 
+    # 3. 如果存在非 ASCII 字符（如中文标签），在首个非 ASCII 处截断。
+    non_ascii = re.search(r"[^\x00-\x7F]", raw)
+    if non_ascii:
+        return raw[: non_ascii.start()].strip(), raw[non_ascii.start() :].strip()
+
+    # 4. 纯 ASCII、无分隔符：整体作为表达式。
     return raw, ""
 
 
@@ -321,6 +326,12 @@ def parse(raw: str) -> ParsedExpression:
 
     表达式无效或为空时抛出 DiceParseError。
     """
+    _MAX_INPUT_LEN = 200
+    if raw and len(raw) > _MAX_INPUT_LEN:
+        raise DiceParseError(
+            f"表达式过长（输入 {len(raw)} 字符，最大 {_MAX_INPUT_LEN} 字符）"
+        )
+
     if not raw or not raw.strip():
         # 默认：单个 d20
         return ParsedExpression(
