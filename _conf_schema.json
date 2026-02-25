@@ -63,7 +63,7 @@
     },
     "whitelist_users": {
         "description": "白名单用户 ID 列表",
-        "hint": "允许使用 /dset 命令的用户 ID，留空则使用 AstrBot 配置的管理员 ID",
+        "hint": "允许使用 /dset 和 /rprefix 命令的用户 ID，留空则使用 AstrBot 配置的管理员 ID",
         "type": "list",
         "default": []
     },
