@@ -161,72 +161,9 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
       - FATE 骰显示 -/0/+
       - 成功计数模式：计入成功的骰值加 *，计入失败的加 x
 
-    优先使用引擎填充的 die_rolls（按位置精确标注，杜绝重复值引发的顺序错乱）。
-    若 die_rolls 为空（如测试直接构造 DiceGroupResult），则回退到基于频率计数的
-    旧路径（原有行为，向后兼容）。
+    依赖引擎填充的 die_rolls（按位置精确标注），若列表为空则返回空括号。
     """
-    # --- 新路径：引擎已提供带状态的 DieRoll 列表 ---
-    if gr.die_rolls:
-        return "[" + ", ".join(_annotate_die(d, gr) for d in gr.die_rolls) + "]"
-
-    # --- 旧路径（向后兼容，用于未填充 die_rolls 的直接构造场景）---
-    # WARNING: 此路径通过频率计数推断每驔骰子的状态。该未必准确
-    # 当多驔骰子面値相同时：不同位置的相同值可能被误属为保留或丢弃。
-    # 请始终在原始投骰路径中填充 die_rolls，尽量不依赖此回退分支。
-    g = gr.group
-    fate = g.fate
-
-    base_count = g.count
-    base_rolls = gr.all_rolls[:base_count]
-    extra_rolls = gr.all_rolls[base_count:]  # 爆炸追加
-
-    rerolled_remaining: dict[int, int] = {}
-    for v in gr.rerolled_originals:
-        rerolled_remaining[v] = rerolled_remaining.get(v, 0) + 1
-
-    dropped_remaining: dict[int, int] = {}
-    for v in gr.dropped_rolls:
-        dropped_remaining[v] = dropped_remaining.get(v, 0) + 1
-
-    display_parts: list[str] = []
-
-    for val in base_rolls:
-        if rerolled_remaining.get(val, 0) > 0:
-            rerolled_remaining[val] -= 1
-            raw = _fate_str(val) if fate else str(val)
-            display_parts.append(f"~{raw}~")
-            continue
-        raw = _fate_str(val) if fate else str(val)
-        if gr.is_success_mode:
-            if g.success_compare and g.success_value is not None:
-                if _cmp(val, g.success_compare, g.success_value):
-                    raw = f"{raw}*"
-                elif (
-                    g.failure_compare
-                    and g.failure_value is not None
-                    and _cmp(val, g.failure_compare, g.failure_value)
-                ):
-                    raw = f"{raw}x"
-        if dropped_remaining.get(val, 0) > 0:
-            dropped_remaining[val] -= 1
-            display_parts.append(f"({raw})")
-        else:
-            display_parts.append(raw)
-
-    for val in extra_rolls:
-        raw = _fate_str(val) if fate else str(val)
-        if gr.is_success_mode and g.success_compare and g.success_value is not None:
-            if _cmp(val, g.success_compare, g.success_value):
-                raw = f"{raw}*"
-            elif (
-                g.failure_compare
-                and g.failure_value is not None
-                and _cmp(val, g.failure_compare, g.failure_value)
-            ):
-                raw = f"{raw}x"
-        display_parts.append(f"{raw}!")
-
-    return "[" + ", ".join(display_parts) + "]"
+    return "[" + ", ".join(_annotate_die(d, gr) for d in gr.die_rolls) + "]"
 
 
 def _rebuild_expr(result: RollResult) -> str:
