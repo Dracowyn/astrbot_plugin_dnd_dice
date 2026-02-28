@@ -30,7 +30,7 @@ class DieRoll:
     """单枚骰子的带状态注解结果。"""
 
     value: int
-    state: str  # 骰子状态："kept"（保留）| "dropped"（丢弃）| "rerolled"（重骰）| "exploded"（爆炸追加）
+    state: str  # 骰子状态："kept"（保留）| "dropped"（丢弃）| "rerolled"（重骰）| "exploded"（爆炸追加）| "kept_capped"（重骰深度耗尽后仍落在应重骰区间）
 
 
 @dataclass
@@ -217,13 +217,18 @@ def _apply_rerolls(
     """
     对 raw_rolls 中满足条件的骰子执行重骰。
 
+    多条件处理规则：
+      - 条件按声明顺序依次检查；每个条件针对经前一条件更新后的 val 进行判断。
+      - 前一版本在首条匹配后即 break；新版移除该限制，实现完整条件链语义。
+
     返回 (final_rolls, rerolled_originals, per_slot_histories)。
       - final_rolls: 重骰后的最终值列表
-      - rerolled_originals: 被替换掉的原始值（向后兼容用）
+      - rerolled_originals: 被替换掉的原始值（向后兼容用；每个位置仅记录一次）
       - per_slot_histories: 每个位置的骰骰历史记录。
         历史记录是 (value, state) 元组的列表，其中 state 为
-        "rerolled"（被替换的原始值）或 "kept"（最终保留值，
-        keep/drop 阶段可能进一步改为 "dropped"）。
+        "rerolled"（被替换的原始值）、"kept"（最终保留值）或
+        "kept_capped"（深度耗尽后仍落在应重骰区间；由格式化层显示 '?' 提示）。
+        "kept"/"kept_capped" 可在后续 keep/drop 阶段进一步改为 "dropped"。
     """
     # 前置短路检查：若某条非"只重骰一次"条件对该骰型的所有可能值均成立，
     # 则重骰永远无法终止，直接报错避免硬跑满 max_depth 次无谓循环。
@@ -246,28 +251,40 @@ def _apply_rerolls(
     for val in raw_rolls:
         original = val
         history: list[tuple[int, str]] = []
+        any_cond_fired = False
 
         for cond in conditions:
             if _compare(val, cond.compare, cond.value):
-                rerolled.append(original)
-                history.append((original, "rerolled"))
+                # 仅在第一个条件命中时记录原始值（向后兼容 rerolled_originals 字段）。
+                if not any_cond_fired:
+                    rerolled.append(original)
+                    any_cond_fired = True
+                history.append((val, "rerolled"))
                 if cond.once:
                     val = _roll_fate() if fate else _roll_single(sides)
                 else:
                     depth = 0
                     while _compare(val, cond.compare, cond.value) and depth < max_depth:
                         new_val = _roll_fate() if fate else _roll_single(sides)
-                        # depth > 0 时当前 val 是中间重骰值，記录完整链路。
-                        # （depth == 0 时原始值已在循环外记录，此处跳过）
+                        # depth > 0 时当前 val 是中间重骰值，记录完整链路。
+                        # （depth == 0 时当前骰值已在上方记录，此处跳过）
                         if depth > 0:
                             history.append((val, "rerolled"))
                         val = new_val
                         depth += 1
-                break  # 一个骰值只触发第一个匹配的条件
+                # 移除 break——继续对更新后的 val 应用后续条件链。
 
+        # 深度耗尽检查：若最终值仍满足某个非 once 重骰条件，
+        # 说明该条件在 max_depth 次内未能摆脱应重骰区间；
+        # 标记为 'kept_capped' 供格式化层进行可读提示。
+        depth_exhausted = any(
+            not cond.once and _compare(val, cond.compare, cond.value)
+            for cond in conditions
+        )
+        final_state = "kept_capped" if depth_exhausted else "kept"
         history.append(
-            (val, "kept")
-        )  # 状态在后续 keep/drop 阶段可能进一步改为 "dropped"
+            (val, final_state)
+        )  # kept_capped 表示应重骰但深度耗尽；后续 keep/drop 阶段可进一步改为 "dropped"
         final.append(val)
         histories.append(history)
 
@@ -409,9 +426,14 @@ def _build_die_rolls(
         # 历史中除最后一项外均为被替换的原始值（state="rerolled"）
         for val, state in history[:-1]:
             die_rolls.append(DieRoll(value=val, state=state))
-        # 最后一项是最终值；keep/drop 阶段决定其最终状态
-        final_val, _ = history[-1]
-        final_state = "dropped" if i in dropped_positions else "kept"
+        # 最后一项是最终值；keep/drop 阶段决定最终状态，但保留 kept_capped 标记。
+        final_val, hist_final_state = history[-1]
+        if i in dropped_positions:
+            final_state = "dropped"
+        elif hist_final_state == "kept_capped":
+            final_state = "kept_capped"
+        else:
+            final_state = "kept"
         die_rolls.append(DieRoll(value=final_val, state=final_state))
     for j, val in enumerate(exploded_extra):
         # 爆炸追加骰也可能被 keep/drop 规则淘汰；
