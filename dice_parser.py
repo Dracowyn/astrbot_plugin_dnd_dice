@@ -100,6 +100,10 @@ _FULLWIDTH_TABLE = str.maketrans(
     "+-*/()" + "0123456789",
 )
 
+# 单次解析允许的最大输入长度（字符数）。
+# 提升为模块级常量，便于系统管理员在配置层或子类中覆盖。
+_MAX_INPUT_LEN: int = 200
+
 
 def _normalize_fullwidth(s: str) -> str:
     """
@@ -384,17 +388,19 @@ def _strip_label(raw: str) -> tuple[str, str]:
         parts = raw.split("#", 1)
         return parts[0].strip(), parts[1].strip()
 
-    # 2. 在首个非 ASCII *字母* 字符处截断（此步须在空白检测之前，
+    # 2. 在首个非 ASCII *字母またはシンボル* 字符处截断（此步须在空白检测之前，
     #    否则 '2d6 + 1d4 伤害' 会在第一个空格处就被截断）。
-    #    仅对 Unicode 字母类别（unicodedata.category 以 'L' 开头，
-    #    即 Lu/Ll/Lt/Lm/Lo，涵盖汉字、假名等自然语言文字）触发截断；
-    #    非 ASCII 标点/符号（如 em-dash U+2013、NBSP U+00A0）不触发，
-    #    避免对含有此类字符的算式表达式进行误分割。
-    # 注意：此策略在首个非 ASCII 字母处截断。若未来表达式语法扩展至
-    # 含非 ASCII 标识符，需在此处添加白名单豁免，避免误截断。
+    #    触发截断的 Unicode 类别：
+    #      - L*（Lu/Ll/Lt/Lm/Lo）：自然语言文字，如 CJK 汉字、假名、西里尔字母
+    #      - S*（Sm/Sc/Sk/So）：符号类，涵盖 Emoji（通常为 So）及数学符号等
+    #    不触发截断：非 ASCII 标点/分隔符（P*、Z*），避免对含有此类字符的
+    #    算式（如带 em-dash 的表达式）进行误分割。
+    # 注意：若未来表达式语法扩展至含非 ASCII 标识符，需在此处添加白名单豁免。
     for i, ch in enumerate(raw):
-        if ord(ch) > 0x7F and unicodedata.category(ch).startswith("L"):
-            return raw[:i].strip(), raw[i:].strip()
+        if ord(ch) > 0x7F:
+            cat = unicodedata.category(ch)
+            if cat.startswith("L") or cat.startswith("S"):
+                return raw[:i].strip(), raw[i:].strip()
 
     # 3. 以第一个空白字符切分（纯 ASCII 输入）。
     ws_match = re.search(r"\s", raw)
@@ -418,7 +424,9 @@ def _strip_label(raw: str) -> tuple[str, str]:
     return raw, ""
 
 
-def parse(raw: str, default_sides: int = 20) -> ParsedExpression:
+def parse(
+    raw: str, default_sides: int = 20, max_input_len: int | None = None
+) -> ParsedExpression:
     """
     将原始骰池表达式字符串解析为 ParsedExpression。
 
@@ -427,12 +435,12 @@ def parse(raw: str, default_sides: int = 20) -> ParsedExpression:
     Args:
         raw: 原始骰池表达式字符串。
         default_sides: 无参数时使用的默认骰面数，默认为 20（d20）。
+        max_input_len: 允许的最大输入长度（字符数）。None 时使用模块级
+            _MAX_INPUT_LEN 默认值（200），主要供插件配置动态覆盖。
     """
-    _MAX_INPUT_LEN = 200
-    if raw and len(raw) > _MAX_INPUT_LEN:
-        raise DiceParseError(
-            f"表达式过长（输入 {len(raw)} 字符，最大 {_MAX_INPUT_LEN} 字符）"
-        )
+    limit = max_input_len if max_input_len is not None else _MAX_INPUT_LEN
+    if raw and len(raw) > limit:
+        raise DiceParseError(f"表达式过长（输入 {len(raw)} 字符，最大 {limit} 字符）")
 
     if not raw or not raw.strip():
         # 默认：单个 dN（N 由调用方指定，通常为 20）
