@@ -537,7 +537,7 @@ def roll(
     total_base_dice = sum(g.count for g in expr.groups)
     if total_base_dice > max_dice:
         raise DiceRollError(
-            f"表达式中骰子总数 {total_base_dice} 超过最大限制 {max_dice}"
+            f"骰子数量 {total_base_dice} 超过单次掷骰限制 {max_dice}（跨所有骰子组合计）"
         )
     result = RollResult(expression=expr)
     for group in expr.groups:
