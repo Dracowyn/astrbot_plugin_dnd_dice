@@ -77,40 +77,53 @@ class RollResult:
 
     @property
     def is_natural_20(self) -> bool:
-        """单枚 d20（非优势/劣势）掷出 20 时为 True。"""
-        for r in self.group_results:
-            g = r.group
-            if g.sides == 20 and g.keep_mode is None and g.count == 1:
-                if r.kept_rolls and r.kept_rolls[0] == 20:
-                    return True
-            # 优势/劣势时，保留值为 20 也算天然 20
-            if (
-                g.sides == 20
-                and g.keep_mode in ("kh", "kl")
-                and g.count == 2
-                and g.keep_n == 1
-            ):
-                if r.kept_rolls and r.kept_rolls[0] == 20:
-                    return True
+        """
+        单枚 d20 掷出 20 时为 True。
+
+        仅在表达式符合单次 d20 检定形态时生效：整个表达式有且仅有一组骰子、
+        该组为 d20（含优势/劣势）且不处于成功计数模式。复合表达式（如 2d6+1d20）不触发。
+        """
+        if len(self.group_results) != 1:
+            return False
+        r = self.group_results[0]
+        if r.is_success_mode:
+            return False
+        g = r.group
+        if g.sides == 20 and g.keep_mode is None and g.count == 1:
+            return bool(r.kept_rolls and r.kept_rolls[0] == 20)
+        # 优势/劣势：2d20kh1 / 2d20kl1
+        if (
+            g.sides == 20
+            and g.keep_mode in ("kh", "kl")
+            and g.count == 2
+            and g.keep_n == 1
+        ):
+            return bool(r.kept_rolls and r.kept_rolls[0] == 20)
         return False
 
     @property
     def is_natural_1(self) -> bool:
-        """单枚 d20 掷出 1 时为 True，含优势（kh）和劣势（kl）场景。"""
-        for r in self.group_results:
-            g = r.group
-            if g.sides == 20 and g.keep_mode is None and g.count == 1:
-                if r.kept_rolls and r.kept_rolls[0] == 1:
-                    return True
-            # 优势（kh）和劣势（kl）——保留骰为 1 均触发"大失败"
-            if (
-                g.sides == 20
-                and g.keep_mode in ("kh", "kl")
-                and g.count == 2
-                and g.keep_n == 1
-            ):
-                if r.kept_rolls and r.kept_rolls[0] == 1:
-                    return True
+        """
+        单枚 d20 掷出 1 时为 True，含优势（kh）和劣势（kl）场景。
+
+        仅在表达式符合单次 d20 检定形态时生效（同 is_natural_20）。
+        """
+        if len(self.group_results) != 1:
+            return False
+        r = self.group_results[0]
+        if r.is_success_mode:
+            return False
+        g = r.group
+        if g.sides == 20 and g.keep_mode is None and g.count == 1:
+            return bool(r.kept_rolls and r.kept_rolls[0] == 1)
+        # 优势（kh）和劣势（kl）——保留骰为 1 均触发"大失败"
+        if (
+            g.sides == 20
+            and g.keep_mode in ("kh", "kl")
+            and g.count == 2
+            and g.keep_n == 1
+        ):
+            return bool(r.kept_rolls and r.kept_rolls[0] == 1)
         return False
 
 
@@ -163,22 +176,6 @@ def _roll_fate() -> int:
 # ---------------------------------------------------------------------------
 
 
-def _roll_standard_exploding(sides: int, group: DiceGroup, max_depth: int) -> list[int]:
-    """标准爆炸：每个骰子独立爆炸，返回该骰子的所有值（首值 + 爆炸追加值）。
-
-    Note: not called by _roll_group (inlined). Kept for external/testing use.
-    """
-    results: list[int] = []
-    depth = 0
-    val = _roll_single(sides)
-    results.append(val)
-    while _should_explode(val, sides, group) and depth < max_depth:
-        depth += 1
-        val = _roll_single(sides)
-        results.append(val)
-    return results
-
-
 def _roll_compound_exploding(sides: int, group: DiceGroup, max_depth: int) -> int:
     """复合爆炸（Shadowrun 风格）：所有爆炸值叠加为单个结果，返回合并总值。"""
     total = 0
@@ -190,24 +187,6 @@ def _roll_compound_exploding(sides: int, group: DiceGroup, max_depth: int) -> in
         val = _roll_single(sides)
         total += val
     return total
-
-
-def _roll_penetrating_exploding(
-    sides: int, group: DiceGroup, max_depth: int
-) -> list[int]:
-    """穿透爆炸（HackMaster 风格）：每次追加骰减 1，返回所有骰值（含追加）。
-
-    Note: not called by _roll_group (inlined). Kept for external/testing use.
-    """
-    results: list[int] = []
-    depth = 0
-    val = _roll_single(sides)
-    results.append(val)
-    while _should_explode(val, sides, group) and depth < max_depth:
-        depth += 1
-        val = max(1, _roll_single(sides) - 1)
-        results.append(val)
-    return results
 
 
 # ---------------------------------------------------------------------------
