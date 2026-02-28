@@ -50,7 +50,7 @@ from .dice_parser import DiceParseError, parse
 from .dice_roller import DiceRollError, roll
 from .formatter import format_result
 
-# Maximum number of session origins to keep in the in-memory prefix cache.
+# 内存前缀缓存所允许的最大会话来源数量。
 _PREFIX_CACHE_MAX: int = 512
 
 # ---------------------------------------------------------------------------
@@ -158,11 +158,11 @@ class DnDDicePlugin(Star):
         # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
         self._character_manager: CharacterManager | None = None
 
-        # In-memory write-through LRU cache for custom prefix per session origin.
-        # Avoids a KV lookup on every incoming message in custom_prefix_route.
-        # Keys are unified_msg_origin strings; None means "no custom prefix set".
-        # OrderedDict preserves insertion-order, enabling O(1) LRU eviction via
-        # move_to_end() on hit and popitem(last=False) on capacity overflow.
+        # 内存写透式 LRU 缓存，按会话来源存储自定义前缀。
+        # 避免在 custom_prefix_route 中对每条消息都进行 KV 存储查询。
+        # 键为 unified_msg_origin 字符串；None 表示“未设置自定义前缀”。
+        # OrderedDict 保留插入顺序，命中时调用 move_to_end() 可实现
+        # O(1) 的 LRU 驱逐，容量溢出时调用 popitem(last=False)。
         self._prefix_cache: OrderedDict[str, str | None] = OrderedDict()
 
     @property
@@ -203,14 +203,14 @@ class DnDDicePlugin(Star):
         """
         origin = event.unified_msg_origin
         if origin not in self._prefix_cache:
-            # Evict the least-recently-used entry when the cache is full.
+            # 缓存已满时驱逐最久未使用的条目。
             if len(self._prefix_cache) >= _PREFIX_CACHE_MAX:
                 self._prefix_cache.popitem(last=False)
             kv_key = f"custom_prefix:{origin}"
             raw = await self.get_kv_data(kv_key, None)
             self._prefix_cache[origin] = str(raw) if raw is not None else None
         else:
-            # Promote to most-recently-used position on cache hit.
+            # 缓存命中时将条目提升至最近使用位置。
             self._prefix_cache.move_to_end(origin)
         cached = self._prefix_cache[origin]
         return cached if cached is not None else self.default_cmd_prefix
@@ -469,8 +469,8 @@ class DnDDicePlugin(Star):
         # 重置会话前缀
         if arg.lower() in ("reset", "重置", "清除"):
             await self.delete_kv_data(key)
-            self._prefix_cache[event.unified_msg_origin] = None  # write-through
-            self._prefix_cache.move_to_end(event.unified_msg_origin)  # promote to MRU
+            self._prefix_cache[event.unified_msg_origin] = None  # 写透缓存
+            self._prefix_cache.move_to_end(event.unified_msg_origin)  # 提升至 MRU 位置
             if self.default_cmd_prefix:
                 yield event.plain_result(
                     f"已清除自定义骰子前缀设置，恢复为默认前缀 {self.default_cmd_prefix!r}。"
@@ -485,8 +485,8 @@ class DnDDicePlugin(Star):
             return
 
         await self.put_kv_data(key, arg)
-        self._prefix_cache[event.unified_msg_origin] = arg  # write-through
-        self._prefix_cache.move_to_end(event.unified_msg_origin)  # promote to MRU
+        self._prefix_cache[event.unified_msg_origin] = arg  # 写透缓存
+        self._prefix_cache.move_to_end(event.unified_msg_origin)  # 提升至 MRU 位置
         yield event.plain_result(
             f"已将自定义骰子前缀设为 {arg!r}。\n"
             f"现在可用 {arg}r、{arg}roll、{arg}dset 等触发骰子功能，\n"
@@ -504,9 +504,9 @@ class DnDDicePlugin(Star):
         prefix = await self._get_effective_prefix(event)
         if not prefix:
             return
-        # When the effective prefix equals the AstrBot system command prefix ("/"),
-        # the @filter.command handlers already process these messages.  Routing
-        # them here too would yield duplicate responses.
+        # 当有效前缀等于 AstrBot 系统命令前缀（"/"）时，
+        # @filter.command 装饰器已处理这些消息，此处不再路由，
+        # 否则会触发重复响应。
         if prefix == "/":
             return
 
