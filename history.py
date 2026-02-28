@@ -8,6 +8,8 @@ history.py — DnD 骰子插件的投掷历史管理模块。
 
 from __future__ import annotations
 
+import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -39,6 +41,9 @@ _DISPLAY_LIMIT = 20
 
 # 存储的结果摘要最大字符数。
 _RESULT_SUMMARY_MAX = 100
+
+# 需要从用户输入和存储字段中剔除的控制字符正则（换行、回车、制表符等）。
+_CONTROL_CHARS_RE = re.compile(r"[\r\n\t\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +105,11 @@ class HistoryEntry:
         ts = datetime.now().strftime("%m-%d %H:%M:%S")  # noqa: DTZ005
 
         return cls(
-            expr=expr,
-            result=first_line,
-            sender_id=str(event.get_sender_id()),
-            sender_name=str(event.get_sender_name()),
+            # 写入前清洗控制字符，防止昵称或表达式中的换行伪造历史行。
+            expr=_sanitize(expr),
+            result=_sanitize(first_line),
+            sender_id=_sanitize(str(event.get_sender_id())),
+            sender_name=_sanitize(str(event.get_sender_name())),
             ts=ts,
         )
 
@@ -113,6 +119,11 @@ class HistoryEntry:
 # ---------------------------------------------------------------------------
 
 
+def _sanitize(text: str) -> str:
+    """剔除字符串中的换行、回车、制表符等控制字符，防止输出时伪造历史行。"""
+    return _CONTROL_CHARS_RE.sub(" ", text).strip()
+
+
 class RollHistoryManager:
     """基于 AstrBot KV 存储的会话级投掷历史管理器。"""
 
@@ -120,6 +131,14 @@ class RollHistoryManager:
         self._star = star
         self._max_count: int = max(1, max_count)
         self._enabled: bool = enabled
+        # 每个 KV key 对应一把锁，防止并发 add() 时读-改-写互相覆盖。
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        """获取（或创建）指定 KV key 的互斥锁。"""
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -144,18 +163,20 @@ class RollHistoryManager:
 
         try:
             key = _KV_PREFIX + event.unified_msg_origin
-            raw = await self._star.get_kv_data(key, [])
-            if not isinstance(raw, list):
-                raw = []
+            # 使用会话级锁保证 读-改-写 原子性，防止并发投掷时互相覆盖。
+            async with self._get_lock(key):
+                raw = await self._star.get_kv_data(key, [])
+                if not isinstance(raw, list):
+                    raw = []
 
-            entry = HistoryEntry.build(event, expr, result)
-            raw.append(entry.to_dict())
+                entry = HistoryEntry.build(event, expr, result)
+                raw.append(entry.to_dict())
 
-            # 超出上限时，保留最新的 _max_count 条，丢弃最旧的记录。
-            if len(raw) > self._max_count:
-                raw = raw[-self._max_count :]
+                # 超出上限时，保留最新的 _max_count 条，丢弃最旧的记录。
+                if len(raw) > self._max_count:
+                    raw = raw[-self._max_count :]
 
-            await self._star.put_kv_data(key, raw)
+                await self._star.put_kv_data(key, raw)
         except (OSError, ValueError, TypeError, RuntimeError) as e:
             # 历史记录属于非核心功能，写入失败只记录警告，不中断正常投掷响应。
             logger.warning(f"[dnd_dice] 写入投掷历史失败: {e}")
@@ -225,14 +246,15 @@ class RollHistoryManager:
         visible = entries[-_DISPLAY_LIMIT:]
         lines: list[str] = []
         for i, entry in enumerate(visible, start=1):
+            # 展示时再次清洗，防止旧版本写入的脏数据造成文本注入。
+            name = _sanitize(entry.sender_name)
+            expr = _sanitize(entry.expr)
+            result = _sanitize(entry.result)
             if show_sender:
                 # 群聊全员模式：仅显示昵称。
-                lines.append(
-                    f"{i}. [{entry.ts}] {entry.sender_name}: "
-                    f"{entry.expr} → {entry.result}"
-                )
+                lines.append(f"{i}. [{entry.ts}] {name}: {expr} → {result}")
             else:
-                lines.append(f"{i}. [{entry.ts}] {entry.expr} → {entry.result}")
+                lines.append(f"{i}. [{entry.ts}] {expr} → {result}")
 
         total = len(entries)
         # 优先使用调用方传入的自定义标题，否则使用通用标题。
