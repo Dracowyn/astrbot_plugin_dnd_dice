@@ -1,6 +1,6 @@
 # astrbot_plugin_dnd_dice
 
-适用于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 D&D 骰子插件，部分实现 Roll20 骰池规范，支持技能检定判定及 LLM
+适用于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 D&D 骰子插件，实现部分 Roll20 骰池规范，支持技能检定判定及 LLM
 函数工具自动调用。
 
 ## 功能
