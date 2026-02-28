@@ -15,7 +15,7 @@ formatter.py — DnD 骰点结果的纯文本格式化器。
 
 from __future__ import annotations
 
-from .dice_roller import DiceGroupResult, RollResult, _compare
+from .dice_roller import DiceGroupResult, DieRoll, RollResult, _compare
 
 # ---------------------------------------------------------------------------
 # FATE 骰值映射
@@ -104,6 +104,30 @@ def _group_label(gr: DiceGroupResult) -> str:
     return f"{sign}{base}{kd_suffix}{explode_mark}{success_str}{failure_str}{reroll_str}{sort_str}"
 
 
+def _annotate_die(die: DieRoll, gr: DiceGroupResult) -> str:
+    """Format a single DieRoll into its display string."""
+    g = gr.group
+    raw = _fate_str(die.value) if g.fate else str(die.value)
+    if die.state == "rerolled":
+        return f"~{raw}~"
+    if die.state == "exploded":
+        return f"{raw}!"
+    # "kept" or "dropped"
+    if gr.is_success_mode and die.state == "kept":
+        if g.success_compare and g.success_value is not None:
+            if _compare(die.value, g.success_compare, g.success_value):
+                raw = f"{raw}*"
+            elif (
+                g.failure_compare
+                and g.failure_value is not None
+                and _compare(die.value, g.failure_compare, g.failure_value)
+            ):
+                raw = f"{raw}x"
+    if die.state == "dropped":
+        return f"({raw})"
+    return raw
+
+
 def _format_dice_list(gr: DiceGroupResult) -> str:
     """
     将单组骰子的各个骰值格式化为括号列表。
@@ -114,7 +138,16 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
       - 爆炸追加骰加 '!' 后缀（复合爆炸无追加骰概念，跳过）
       - FATE 骰显示 -/0/+
       - 成功计数模式：计入成功的骰值加 *，计入失败的加 x
+
+    优先使用引擎填充的 die_rolls（按位置精确标注，杜绝重复值引发的顺序错乱）。
+    若 die_rolls 为空（如测试直接构造 DiceGroupResult），则回退到基于频率计数的
+    旧路径（原有行为，向后兼容）。
     """
+    # --- 新路径：引擎已提供带状态的 DieRoll 列表 ---
+    if gr.die_rolls:
+        return "[" + ", ".join(_annotate_die(d, gr) for d in gr.die_rolls) + "]"
+
+    # --- 旧路径（向后兼容，用于未填充 die_rolls 的直接构造场景）---
     g = gr.group
     fate = g.fate
 
@@ -122,12 +155,10 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
     base_rolls = gr.all_rolls[:base_count]
     extra_rolls = gr.all_rolls[base_count:]  # 爆炸追加
 
-    # 被重骰替换值的引用计数
     rerolled_remaining: dict[int, int] = {}
     for v in gr.rerolled_originals:
         rerolled_remaining[v] = rerolled_remaining.get(v, 0) + 1
 
-    # 被丢弃值的引用计数
     dropped_remaining: dict[int, int] = {}
     for v in gr.dropped_rolls:
         dropped_remaining[v] = dropped_remaining.get(v, 0) + 1
@@ -135,14 +166,12 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
     display_parts: list[str] = []
 
     for val in base_rolls:
-        # 先判断是否为被重骰的原始值（展示为波浪线）
         if rerolled_remaining.get(val, 0) > 0:
             rerolled_remaining[val] -= 1
             raw = _fate_str(val) if fate else str(val)
             display_parts.append(f"~{raw}~")
             continue
         raw = _fate_str(val) if fate else str(val)
-        # 成功/失败计数标注
         if gr.is_success_mode:
             if g.success_compare and g.success_value is not None:
                 if _compare(val, g.success_compare, g.success_value):
