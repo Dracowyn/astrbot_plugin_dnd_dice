@@ -1,13 +1,11 @@
 """
-character.py — DnD 骰子插件的角色卡模块（当前版本为存根）。
+character.py — DnD 骰子插件的角色卡模块。
 
 本模块定义了 DnD 角色卡的数据结构与管理器接口
 （属性值、技能熟练度、豁免等）。
 
-当前版本：仅存根，所有数据操作均抛出 NotImplementedError。
+当前实现：load/save/delete 在内存 LRU 缓存中运行，不跨进程持久化。
 未来版本将通过 AstrBot KV 存储实现持久化，并支持以下功能：
-  - 自动计算属性修正值
-  - 熟练加值应用
   - 命名掷骰快捷方式（如 "/r str" → 1d20+<力量修正>）
   - 按会话绑定角色
   - 从 D&D Beyond / Roll20 JSON 格式导入
