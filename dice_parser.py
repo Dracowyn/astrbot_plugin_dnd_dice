@@ -341,11 +341,20 @@ def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
     group = DiceGroup(count=count, sides=sides, fate=fate)
 
     # 4–8. 依次应用各类修饰（每个函数就地修改 group 并返回更新后的 pos）
+    pos_after_base = pos  # 占位：消耗必选 NdM 后的位置
     pos = _parse_keep_drop(expr, pos, group)
     pos = _parse_exploding(expr, pos, group)
     pos = _parse_success_failure(expr, pos, group)
     pos = _parse_reroll(expr, pos, group)
     pos = _parse_sort(expr, pos, group)
+
+    # 安全守卫：若所有子解析器均未前进，且剩余字符为字母，
+    # 说明存在无法识别的修饰符，立即报错而非回退到主循环再失败。
+    if pos == pos_after_base and pos < len(expr) and expr[pos].isalpha():
+        raise DiceParseError(
+            f"无法识别的骰子修饰符 {expr[pos:]!r}"
+            f"（应为 kh/kl/k、dl/dh/d<N>、!、>/<、r/ro、s/s[ad] 之一）"
+        )
 
     return group, pos
 
@@ -464,6 +473,10 @@ def parse(raw: str, default_sides: int = 20) -> ParsedExpression:
 
         group, new_pos = _parse_dice_token(expr_str, pos)
         if group is not None:
+            if new_pos == pos:
+                # 安全守卫：_parse_dice_token 返回了骰子组但位置未前进，
+                # 这将导致死循环。正常情况下不应出现，属于防御性布局。
+                raise DiceParseError(f"无法继续解析骰池表达式: '{raw}'")
             found_any = True
             if sign == -1:
                 group.modifier = -1  # 哨兵值：执行器将对小计取反
