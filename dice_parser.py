@@ -291,11 +291,13 @@ def _strip_label(raw: str) -> tuple[str, str]:
     """
     从原始输入中分离表达式部分与可选标签。
 
-    分離策略（优先级从高到低）：
+    分离策略（优先级从高到低）：
       1. '#' 强制分隔符，优先处理。
-      2. 以第一个空白字符切分——兼容『d20 技能名 15』。
-      3. 如果无空格、无 '#'，且包含非 ASCII 字符（如中文），
-         则在首个非 ASCII 字符处截断——兼容『d20技能名10』。
+      2. 在首个非 ASCII 字符（如中文）处截断——兼容『d20 感知 15』、
+         『2d6 + 1d4 伤害』（先找非 ASCII 再处理空格，避免算式空格误判为标签）。
+      3. 以第一个空白字符切分：
+         a. 若空白后紧跟 +/- 运算符，整体去空格视为纯算式，无标签。
+         b. 否则按空白切分——兼容『d20 感知 15』（纯 ASCII 标签）。
       4. 纯 ASCII 且无分隔符：整体作为表达式，无标签。
          ASCII 标签必须通过 '#' 或空格显式分隔。
 
@@ -308,15 +310,21 @@ def _strip_label(raw: str) -> tuple[str, str]:
         parts = raw.split("#", 1)
         return parts[0].strip(), parts[1].strip()
 
-    # 2. 以第一个空白字符切分。
-    ws_match = re.search(r"\s", raw)
-    if ws_match:
-        return raw[: ws_match.start()].strip(), raw[ws_match.start() :].strip()
-
-    # 3. 如果存在非 ASCII 字符（如中文标签），在首个非 ASCII 处截断。
+    # 2. 在首个非 ASCII 字符处截断（此步须在空白检测之前，
+    #    否则 '2d6 + 1d4 伤害' 会在第一个空格处就被截断）。
     non_ascii = re.search(r"[^\x00-\x7F]", raw)
     if non_ascii:
         return raw[: non_ascii.start()].strip(), raw[non_ascii.start() :].strip()
+
+    # 3. 以第一个空白字符切分（纯 ASCII 输入）。
+    ws_match = re.search(r"\s", raw)
+    if ws_match:
+        after = raw[ws_match.start() :].lstrip()
+        # 若空白后紧跟运算符，说明这是算式内部空格（如 '2d6 + 1d4'），
+        # 去除所有空格后整体作为表达式，不分离标签。
+        if after and after[0] in ("+", "-"):
+            return raw.replace(" ", "").replace("\t", ""), ""
+        return raw[: ws_match.start()].strip(), raw[ws_match.start() :].strip()
 
     # 4. 纯 ASCII、无分隔符：整体作为表达式。
     return raw, ""
@@ -352,8 +360,11 @@ def parse(raw: str, default_sides: int = 20) -> ParsedExpression:
     #   '技能名15'  → label='技能名', dc=15
     dc: int | None = None
     if label:
-        # .*\D 确保数字前至少有一个非数字字符，避免把纯标签误判。
-        dc_match = re.match(r"^(.*\D)(\d+)\s*$", label)
+        # 仅在「空格 + 纯整数尾段」时提取 DC，避免 '房间2' 被误判为 DC=2。
+        # 兼容写法：
+        #   '感知 15'  → label='感知', dc=15（空格分隔）
+        #   '15'       → label='', dc=15（纯数字标签）
+        dc_match = re.match(r"^(.+\S)\s+(\d+)\s*$", label)
         if dc_match:
             label = dc_match.group(1).strip()
             dc = int(dc_match.group(2))
