@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.1] - 2026-03-01
+
+### 修复
+- 修复 `/rh clear` 命令在 `enable_whitelist=False` 时群聊内任意用户均可清空历史的权限漏洞：新增独立的 `_check_history_clear_permission()` 逻辑，关闭白名单时群聊回退到 AstrBot 管理员判断，而非全放行。
+- 修复 `RollHistoryManager.add()` 中读-改-写非原子导致并发投掷时历史条目互相覆盖的问题：引入按会话 key 的 `asyncio.Lock`，保证同一会话的写操作串行执行。
+- 修复昵称、投掷表达式及结果中包含换行符等控制字符时可伪造历史行的文本注入风险：新增 `_sanitize()` 函数，在写入存储前和展示时双重剔除 `\r`、`\n`、`\t` 及其他非打印控制字符。
+
 ## [0.6.0] - 2026-03-01
 
 ### 新增
