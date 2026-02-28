@@ -1,6 +1,6 @@
 name: astrbot_plugin_dnd_dice
 display_name: D&D 骰子 Dice
-desc: 支持 D&D （Roll20规范）骰池语法的掷骰插件，包括优势/劣势、保留最高/最低、爆炸骰、多骰组合等以及 LLM 函数工具调用。
+desc: 支持 D&D （Roll20规范）骰池语法的骰子插件，包括优势/劣势、保留最高/最低、爆炸骰、多骰组合等以及 LLM 函数工具调用。
 version: v0.5.1
 author: Dracowyn
 repo: https://github.com/Dracowyn/astrbot_plugin_dnd_dice
