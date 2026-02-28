@@ -115,12 +115,12 @@ class CharacterSheet:
     named_rolls: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # Clamp level to the legal 5e range [1, 20]
+        # 将等级限制在 5e 合法范围 [1, 20] 内
         try:
             self.level = max(1, min(20, int(self.level)))
         except (TypeError, ValueError):
             self.level = 1
-        # Normalize proficiency sets to lowercase for consistent lookup
+        # 将熟练集合统一转为小写，保证查询时大小写一致
         self.skill_proficiencies = {s.lower() for s in self.skill_proficiencies}
         self.save_proficiencies = {s.lower() for s in self.save_proficiencies}
 
@@ -166,26 +166,28 @@ class _BoundedLRUCache:
 
     def __init__(self, maxsize: int = _CACHE_MAX_SIZE) -> None:
         self._store: OrderedDict[str, CharacterSheet] = OrderedDict()
-        self._maxsize = maxsize
+        # 强制最小値为 1；若 maxsize=0， set() 会立即在空 OrderedDict 上
+        # 调用 popitem()，导致 KeyError。
+        self._maxsize = max(1, maxsize)
 
     def get(self, key: str) -> CharacterSheet | None:
-        """Return the sheet for *key*, marking it as recently used."""
+        """返回 *key* 对应的角色卡，并将其标记为最近使用。"""
         if key not in self._store:
             return None
-        self._store.move_to_end(key)  # refresh recency
+        self._store.move_to_end(key)  # 刷新最近使用顺序
         return self._store[key]
 
     def set(self, key: str, value: CharacterSheet) -> None:
-        """Insert or update *key*, evicting the LRU entry if at capacity."""
+        """插入或更新 *key*，若容量已满则驱逐 LRU 条目。"""
         if key in self._store:
             self._store.move_to_end(key)
         else:
             if len(self._store) >= self._maxsize:
-                self._store.popitem(last=False)  # evict least-recently-used
+                self._store.popitem(last=False)  # 驱逐最久未使用条目
         self._store[key] = value
 
     def pop(self, key: str) -> None:
-        """Remove *key* if present; no-op otherwise."""
+        """移除 *key*；若不存在则无操作。"""
         self._store.pop(key, None)
 
 
