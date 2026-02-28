@@ -9,10 +9,16 @@ character.py — DnD 骰子插件的角色卡模块。
   - 命名掷骰快捷方式（如 "/r str" → 1d20+<力量修正>）
   - 按会话绑定角色
   - 从 D&D Beyond / Roll20 JSON 格式导入
+
+注意（开发规范）：未来涉及本地文件读写时，必须通过
+    from astrbot.api.star import StarTools
+并调用 StarTools.get_data_dir() 获取 Path 对象进行文件读写，
+严禁使用硬编码路径。
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -58,20 +64,19 @@ class AbilityScores:
 
     def __post_init__(self) -> None:
         """Clamp ability scores to the legal DnD range [1, 30]."""
-        for attr in (
-            "strength",
-            "dexterity",
-            "constitution",
-            "intelligence",
-            "wisdom",
-            "charisma",
-        ):
-            raw = getattr(self, attr)
+
+        def _clamp(v: object) -> int:
             try:
-                clamped = max(1, min(30, int(raw)))
+                return max(1, min(30, int(v)))  # type: ignore[arg-type]
             except (TypeError, ValueError):
-                clamped = 10
-            setattr(self, attr, clamped)
+                return 10
+
+        self.strength = _clamp(self.strength)
+        self.dexterity = _clamp(self.dexterity)
+        self.constitution = _clamp(self.constitution)
+        self.intelligence = _clamp(self.intelligence)
+        self.wisdom = _clamp(self.wisdom)
+        self.charisma = _clamp(self.charisma)
 
     def get(self, ability: str) -> int:
         """根据属性缩写（str/dex/con/int/wis/cha）返回对应属性值。"""
@@ -212,6 +217,9 @@ class CharacterManager:
         self._star = star
         # LRU 内存缓存：user_id -> CharacterSheet，容量有界避免内存泄漏
         self._cache: _BoundedLRUCache = _BoundedLRUCache()
+        # 异步并发锁：保护 save/load/delete 的非原子操作序列，
+        # 防止未来引入 await（如 KV 存储写入）时出现竞态条件。
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def load(self, user_id: str) -> CharacterSheet | None:
         """
@@ -220,7 +228,8 @@ class CharacterManager:
         当前实现：仅内存缓存，不跨会话持久化。
         未来实现：从 KV 存储反序列化。
         """
-        return self._cache.get(user_id)
+        async with self._lock:
+            return self._cache.get(user_id)
 
     async def save(self, user_id: str, sheet: CharacterSheet) -> None:
         """
@@ -229,7 +238,8 @@ class CharacterManager:
         当前实现：仅内存缓存，不跨会话持久化。
         未来实现：序列化到 KV 存储。
         """
-        self._cache.set(user_id, sheet)
+        async with self._lock:
+            self._cache.set(user_id, sheet)
 
     async def delete(self, user_id: str) -> None:
         """
@@ -238,7 +248,8 @@ class CharacterManager:
         当前实现：仅从内存缓存移除。
         未来实现：同时从 KV 存储删除。
         """
-        self._cache.pop(user_id)
+        async with self._lock:
+            self._cache.pop(user_id)
 
     def get_cached(self, user_id: str) -> CharacterSheet | None:
         """返回内存缓存中的角色卡（不访问 KV 存储）。"""
