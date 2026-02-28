@@ -84,5 +84,16 @@
         "hint": "启用后，用户可使用 /rprefix <符号> 为当前会话独立设置触发前缀（受白名单限制）",
         "type": "bool",
         "default": true
+    },
+    "max_input_len": {
+        "description": "表达式最大输入长度",
+        "hint": "单次掷骰表达式允许的最大字符数，超出此长度的输入将被拒绝",
+        "type": "int",
+        "default": 200,
+        "slider": {
+            "min": 10,
+            "max": 1000,
+            "step": 10
+        }
     }
 }

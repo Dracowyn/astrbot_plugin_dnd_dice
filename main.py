@@ -135,6 +135,7 @@ class DnDDicePlugin(Star):
         self.exploding_max_depth: int = _safe_int(
             cfg.get("exploding_max_depth"), 20, min_val=1
         )
+        self.max_input_len: int = _safe_int(cfg.get("max_input_len"), 200, min_val=10)
         self.show_detail: bool = _safe_bool(cfg.get("show_detail"), True)
 
         # 骰面大小配置
@@ -298,7 +299,11 @@ class DnDDicePlugin(Star):
             default_sides: 空表达式时使用的默认骰面数。
         """
         try:
-            expr = parse(expression_str, default_sides=default_sides)
+            expr = parse(
+                expression_str,
+                default_sides=default_sides,
+                max_input_len=self.max_input_len,
+            )
         except DiceParseError as e:
             return f"解析错误: {e}\n{_SYNTAX_HELP}"
 
@@ -314,9 +319,9 @@ class DnDDicePlugin(Star):
 
         try:
             return format_result(result, show_detail=self.show_detail)
-        except Exception as e:  # noqa: BLE001
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
             logger.exception(f"[dnd_dice] 格式化结果时发生意外错误: {e}")
-            return "掷骰完成，但系统内部错误"
+            return "掷骰完成，但格式化时发生内部错误"
 
     # ------------------------------------------------------------------
     # /dset 命令核心逻辑（供标准命令和自定义前缀路由共用）
@@ -589,31 +594,16 @@ class DnDDicePlugin(Star):
         label: str = "",
     ) -> str:
         """
-        在 TRPG/DnD 游戏中掷骰子。当需要进行攻击骰、伤害骰、属性检定、豁免
-        或任何需要随机结果的场合时调用此工具。返回值为掷骰结果，你需要将结果融入叙事中。
+        在 TRPG/DnD 游戏中掷骰子。当需要进行攻击骰、伤害骰、属性检定、豁免或任何
+        需要随机结果的场合时调用此工具。返回掷骰结果，由你将结果融入叙事后回复给用户。
 
         Args:
             expression(string): DnD/Roll20 标准骰池表达式，不含标签和 DC。
-                - 基础骰: "d20", "1d20", "2d6", "d8"
-                - FATE 骰: "4dF"（-1/0/+1 三面骰）
-                - 带修正: "1d20+5", "2d6+3", "d20-1"
-                - 保留最高/最低: "4d6kh3"（4d6取高3）, "2d20kl1"（2d20取低1）
-                - k = kh 简写: "8d100k4"
-                - 丢弃最低/最高: "8d6d3"(dl3), "8d6dh3"
-                - 优势/劣势: "d20adv"（优势）, "d20dis"（劣势）
-                - 标准爆炸骰: "d6!", "d6!>4"（>=4 即爆）
-                - 复合爆炸: "5d6!!"（Shadowrun 风格）
-                - 穿透爆炸: "5d6!p"（HackMaster 风格）
-                - 目标数成功计数: "3d6>3", "10d6<4"
-                - 成功+失败计数: "3d6>3f1"
-                - 重骰: "2d8r<2"（循环）, "2d6ro<2"（只重骰一次）
-                - 排序: "8d6s"（升序）, "8d6sd"（降序）
-                - 多骰组合: "2d6+1d4", "1d8+1d6+5"
+                常用格式：d20、1d20+5、4d6kh3、2d20kl1（劣势）、4dF（FATE 骰）、
+                d6!（爆炸骰）、3d6>3（目标数成功计数）。
             label(string): 本次投掷的说明，不需要标签时传空字符串。
-                - 仅说明: "攻击检定", "力量豁免", "火球伤害"
-                - 含 DC 判定: "感知 15", "奥秘检定 12"（标签与 DC 之间必须有空格）
-                  → 掷骰总计 >= DC 时输出"成功"，否则"失败"
-                  → 天然 20 强制为"大成功"，天然 1 强制为"大失败"
+                含 DC 判定时格式为"说明 数字"（如 "感知 15"），
+                掷骰总计 >= DC 时输出"成功"，否则"失败"。
         """
         # 将标签拼入表达式，交给解析器处理。
         if label:
