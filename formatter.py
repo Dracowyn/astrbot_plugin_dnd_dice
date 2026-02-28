@@ -15,7 +15,7 @@ formatter.py — DnD 骰点结果的纯文本格式化器。
 
 from __future__ import annotations
 
-from .dice_roller import DiceGroupResult, DieRoll, RollResult, _compare
+from .dice_roller import DiceGroupResult, DieRoll, RollResult
 
 # ---------------------------------------------------------------------------
 # FATE 骰值映射
@@ -26,6 +26,18 @@ _FATE_DISPLAY = {-1: "-", 0: "0", 1: "+"}
 
 def _fate_str(v: int) -> str:
     return _FATE_DISPLAY.get(v, str(v))
+
+
+def _cmp(value: int, op: str, threshold: int) -> bool:
+    """计算 value <op> threshold，其中 '>' / '<' 分别表示 >= / <=。
+
+    与 dice_roller._compare 逻辑一致，但避免导入私有名称。
+    """
+    if op == ">":
+        return value >= threshold
+    if op == "<":
+        return value <= threshold
+    return value == threshold
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +127,12 @@ def _annotate_die(die: DieRoll, gr: DiceGroupResult) -> str:
     # "kept" or "dropped"
     if gr.is_success_mode and die.state == "kept":
         if g.success_compare and g.success_value is not None:
-            if _compare(die.value, g.success_compare, g.success_value):
+            if _cmp(die.value, g.success_compare, g.success_value):
                 raw = f"{raw}*"
             elif (
                 g.failure_compare
                 and g.failure_value is not None
-                and _compare(die.value, g.failure_compare, g.failure_value)
+                and _cmp(die.value, g.failure_compare, g.failure_value)
             ):
                 raw = f"{raw}x"
     if die.state == "dropped":
@@ -148,6 +160,9 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
         return "[" + ", ".join(_annotate_die(d, gr) for d in gr.die_rolls) + "]"
 
     # --- 旧路径（向后兼容，用于未填充 die_rolls 的直接构造场景）---
+    # WARNING: 此路径通过频率计数推断每驔骰子的状态。该未必准确
+    # 当多驔骰子面値相同时：不同位置的相同值可能被误属为保留或丢弃。
+    # 请始终在原始投骰路径中填充 die_rolls，尽量不依赖此回退分支。
     g = gr.group
     fate = g.fate
 
@@ -174,12 +189,12 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
         raw = _fate_str(val) if fate else str(val)
         if gr.is_success_mode:
             if g.success_compare and g.success_value is not None:
-                if _compare(val, g.success_compare, g.success_value):
+                if _cmp(val, g.success_compare, g.success_value):
                     raw = f"{raw}*"
                 elif (
                     g.failure_compare
                     and g.failure_value is not None
-                    and _compare(val, g.failure_compare, g.failure_value)
+                    and _cmp(val, g.failure_compare, g.failure_value)
                 ):
                     raw = f"{raw}x"
         if dropped_remaining.get(val, 0) > 0:
