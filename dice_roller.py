@@ -92,6 +92,34 @@ class RollResult:
     def label(self) -> str:
         return self.expression.label
 
+    def _check_natural_roll(self, target: int) -> bool:
+        """
+        辅助方法：检查是否在符合单次 d20 检定形态的表达式中掷出了 target 值。
+
+        条件：整个表达式仅有一组骰子、不处于成功计数模式，且该组为：
+          - 普通单枚 d20（1d20），或
+          - 优势/劣势（2d20kh1 / 2d20kl1）
+        用于 is_natural_20 / is_natural_1 的共享判断逻辑。
+        """
+        if len(self.group_results) != 1:
+            return False
+        r = self.group_results[0]
+        if r.is_success_mode:
+            return False
+        g = r.group
+        # 普通单枚 d20
+        if g.sides == 20 and g.keep_mode is None and g.count == 1:
+            return bool(r.kept_rolls and r.kept_rolls[0] == target)
+        # 优势/劣势：2d20kh1 / 2d20kl1
+        if (
+            g.sides == 20
+            and g.keep_mode in ("kh", "kl")
+            and g.count == 2
+            and g.keep_n == 1
+        ):
+            return bool(r.kept_rolls and r.kept_rolls[0] == target)
+        return False
+
     @property
     def is_natural_20(self) -> bool:
         """
@@ -100,23 +128,7 @@ class RollResult:
         仅在表达式符合单次 d20 检定形态时生效：整个表达式有且仅有一组骰子、
         该组为 d20（含优势/劣势）且不处于成功计数模式。复合表达式（如 2d6+1d20）不触发。
         """
-        if len(self.group_results) != 1:
-            return False
-        r = self.group_results[0]
-        if r.is_success_mode:
-            return False
-        g = r.group
-        if g.sides == 20 and g.keep_mode is None and g.count == 1:
-            return bool(r.kept_rolls and r.kept_rolls[0] == 20)
-        # 优势/劣势：2d20kh1 / 2d20kl1
-        if (
-            g.sides == 20
-            and g.keep_mode in ("kh", "kl")
-            and g.count == 2
-            and g.keep_n == 1
-        ):
-            return bool(r.kept_rolls and r.kept_rolls[0] == 20)
-        return False
+        return self._check_natural_roll(20)
 
     @property
     def is_natural_1(self) -> bool:
@@ -125,23 +137,7 @@ class RollResult:
 
         仅在表达式符合单次 d20 检定形态时生效（同 is_natural_20）。
         """
-        if len(self.group_results) != 1:
-            return False
-        r = self.group_results[0]
-        if r.is_success_mode:
-            return False
-        g = r.group
-        if g.sides == 20 and g.keep_mode is None and g.count == 1:
-            return bool(r.kept_rolls and r.kept_rolls[0] == 1)
-        # 优势（kh）和劣势（kl）——保留骰为 1 均触发"大失败"
-        if (
-            g.sides == 20
-            and g.keep_mode in ("kh", "kl")
-            and g.count == 2
-            and g.keep_n == 1
-        ):
-            return bool(r.kept_rolls and r.kept_rolls[0] == 1)
-        return False
+        return self._check_natural_roll(1)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +225,20 @@ def _apply_rerolls(
         "rerolled"（被替换的原始值）或 "kept"（最终保留值，
         keep/drop 阶段可能进一步改为 "dropped"）。
     """
+    # 前置短路检查：若某条非"只重骰一次"条件对该骰型的所有可能值均成立，
+    # 则重骰永远无法终止，直接报错避免硬跑满 max_depth 次无谓循环。
+    # 仅对普通骰（sides > 0，非 FATE）执行此检查；FATE 骰面固定为 -1/0/+1，
+    # 不在此处特判（极少见且不影响正确性）。
+    if not fate and sides > 0:
+        for cond in conditions:
+            if not cond.once and all(
+                _compare(v, cond.compare, cond.value) for v in range(1, sides + 1)
+            ):
+                raise DiceRollError(
+                    f"重骰条件 r{cond.compare}{cond.value} 对 d{sides} 的所有面值均成立，"
+                    "骰子无法达到稳定值，请检查表达式。"
+                )
+
     final: list[int] = []
     rerolled: list[int] = []
     histories: list[list[tuple[int, str]]] = []
