@@ -42,7 +42,10 @@ from collections.abc import AsyncGenerator
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
+
+# Maximum number of session origins to keep in the in-memory prefix cache.
+_PREFIX_CACHE_MAX: int = 512
 
 from .character import CharacterManager
 from .dice_parser import DiceParseError, parse
@@ -117,12 +120,6 @@ _SYNTAX_HELP = (
 # ---------------------------------------------------------------------------
 
 
-@register(
-    "astrbot_plugin_dnd_dice",
-    "Dracowyn",
-    "支持完整 Roll20 骰池规范的 DnD 掷骰插件，含 FATE 骰、丢弃骰、爆炸变体、成功计数、重骰、排序及 LLM 工具调用。",
-    "0.2.0",
-)
 class DnDDicePlugin(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
@@ -160,6 +157,11 @@ class DnDDicePlugin(Star):
         # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
         self._character_manager: CharacterManager | None = None
 
+        # In-memory write-through cache for custom prefix per session origin.
+        # Avoids a KV lookup on every incoming message in custom_prefix_route.
+        # Keys are unified_msg_origin strings; None means "no custom prefix set".
+        self._prefix_cache: dict[str, str | None] = {}
+
     @property
     def character_manager(self) -> CharacterManager:
         """懒加载角色卡管理器（核心持久化接口在后续版本中实现）。"""
@@ -194,12 +196,19 @@ class DnDDicePlugin(Star):
         获取当前会话的有效自定义触发前缀。
 
         优先使用会话级设置（通过 /rprefix 命令设置），不存在则回退到全局配置值。
+        结果缓存在 _prefix_cache 中，避免对每条消息都访问 KV 存储。
         """
-        key = f"custom_prefix:{event.unified_msg_origin}"
-        prefix = await self.get_kv_data(key, None)
-        if prefix is not None:
-            return str(prefix)
-        return self.default_cmd_prefix
+        origin = event.unified_msg_origin
+        if origin not in self._prefix_cache:
+            # Evict oldest entry when cache is full (insertion-order eviction).
+            if len(self._prefix_cache) >= _PREFIX_CACHE_MAX:
+                oldest = next(iter(self._prefix_cache))
+                del self._prefix_cache[oldest]
+            kv_key = f"custom_prefix:{origin}"
+            raw = await self.get_kv_data(kv_key, None)
+            self._prefix_cache[origin] = str(raw) if raw is not None else None
+        cached = self._prefix_cache[origin]
+        return cached if cached is not None else self.default_cmd_prefix
 
     async def _whitelist_check(self, event: AstrMessageEvent) -> bool:
         """
@@ -455,6 +464,7 @@ class DnDDicePlugin(Star):
         # 重置会话前缀
         if arg.lower() in ("reset", "重置", "清除"):
             await self.delete_kv_data(key)
+            self._prefix_cache[event.unified_msg_origin] = None  # write-through
             if self.default_cmd_prefix:
                 yield event.plain_result(
                     f"已清除自定义骰子前缀设置，恢复为默认前缀 {self.default_cmd_prefix!r}。"
@@ -469,6 +479,7 @@ class DnDDicePlugin(Star):
             return
 
         await self.put_kv_data(key, arg)
+        self._prefix_cache[event.unified_msg_origin] = arg  # write-through
         yield event.plain_result(
             f"已将自定义骰子前缀设为 {arg!r}。\n"
             f"现在可用 {arg}r、{arg}roll、{arg}dset 等触发骰子功能，\n"
