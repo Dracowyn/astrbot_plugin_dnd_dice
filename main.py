@@ -305,6 +305,24 @@ class DnDDicePlugin(Star):
             return False
         return await self._whitelist_check(event)
 
+    async def _check_history_clear_permission(self, event: AstrMessageEvent) -> bool:
+        """
+        检查当前用户是否有权清除群聊投掷历史。
+
+        私聊中任何人均可清除（仅影响自身数据）。
+        群聊中始终需要明确权限：
+          - enable_whitelist 开启时：使用通用白名单验证（已在白名单或管理员）。
+          - enable_whitelist 关闭时：回退到 AstrBot 管理员判断，
+            避免白名单功能被整体关闭时任意群成员就可清除历史。
+        """
+        if event.is_private_chat():
+            return True
+        # 群聊始终需要权限：白名单已开启则用通用验证，
+        # 关闭时回退到管理员判断而非全放行。
+        if self.enable_whitelist:
+            return await self._whitelist_check(event)
+        return event.is_admin()
+
     # ------------------------------------------------------------------
     # 内部辅助方法
     # ------------------------------------------------------------------
@@ -578,8 +596,8 @@ class DnDDicePlugin(Star):
 
         # --- 清除历史 ---
         if arg_lower in ("clear", "清除", "清空"):
-            # 群聊需白名单权限；私聊任何人均可清除自己的历史
-            if not event.is_private_chat() and not await self._whitelist_check(event):
+            # 私聊任何人均可清除，群聊始终需要权限（白名单关闭时回退管理员判断）
+            if not await self._check_history_clear_permission(event):
                 yield event.plain_result("你没有权限清除群聊中的投掷历史记录。")
                 return
             count = await self._history.clear(event)
