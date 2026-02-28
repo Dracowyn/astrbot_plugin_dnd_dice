@@ -38,6 +38,7 @@ LLM 函数工具：
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 
@@ -52,6 +53,9 @@ from .formatter import format_result
 
 # 内存前缀缓存所允许的最大会话来源数量。
 _PREFIX_CACHE_MAX: int = 512
+# 前缀缓存条目 TTL（秒）。超时后下次访问触发 KV 重新验证，
+# 降低外部直接修改 KV 后本实例长期持有陈旧前缀的风险。
+_PREFIX_CACHE_TTL: float = 300.0
 
 # ---------------------------------------------------------------------------
 # 配置读取辅助函数
@@ -163,7 +167,10 @@ class DnDDicePlugin(Star):
         # 键为 unified_msg_origin 字符串；None 表示“未设置自定义前缀”。
         # OrderedDict 保留插入顺序，命中时调用 move_to_end() 可实现
         # O(1) 的 LRU 驱逐，容量溢出时调用 popitem(last=False)。
-        self._prefix_cache: OrderedDict[str, str | None] = OrderedDict()
+        self._prefix_cache: OrderedDict[str, str | None] = (
+            OrderedDict()
+        )  # 每个缓存条目的写入时间戳（monotonic），用于 TTL 过期检测。
+        self._prefix_cache_ts: dict[str, float] = {}
 
     @property
     def character_manager(self) -> CharacterManager:
@@ -200,14 +207,18 @@ class DnDDicePlugin(Star):
 
         优先使用会话级设置（通过 /rprefix 命令设置），不存在则回退到全局配置值。
         结果缓存在 _prefix_cache 中，避免对每条消息都访问 KV 存储。
+        缓存条目在 _PREFIX_CACHE_TTL 秒后过期失效，届时重新读取 KV，
+        以便感知外部直接修改（其他实例、后台脚本等）带来的前缀变更。
         """
         origin = event.unified_msg_origin
-        if origin not in self._prefix_cache:
+        now = time.monotonic()
+        ttl_expired = now - self._prefix_cache_ts.get(origin, 0.0) > _PREFIX_CACHE_TTL
+        if origin not in self._prefix_cache or ttl_expired:
             kv_key = f"custom_prefix:{origin}"
             raw = await self.get_kv_data(kv_key, None)
             self._set_prefix_cache(origin, str(raw) if raw is not None else None)
         else:
-            # 缓存命中时将条目提升至最近使用位置。
+            # 缓存命中且未过期：将条目提升至最近使用位置。
             self._prefix_cache.move_to_end(origin)
         cached = self._prefix_cache[origin]
         return cached if cached is not None else self.default_cmd_prefix
@@ -218,10 +229,12 @@ class DnDDicePlugin(Star):
             origin not in self._prefix_cache
             and len(self._prefix_cache) >= _PREFIX_CACHE_MAX
         ):
-            # 缓存已满 且 key 不在缓存中：驱逐最久未使用的条目。
-            self._prefix_cache.popitem(last=False)
+            # 缓存已满 且 key 不在缓存中：驱逐最久未使用的条目及其时间戳。
+            evicted, _ = self._prefix_cache.popitem(last=False)
+            self._prefix_cache_ts.pop(evicted, None)
         self._prefix_cache[origin] = value
         self._prefix_cache.move_to_end(origin)  # 提升至 MRU 位置
+        self._prefix_cache_ts[origin] = time.monotonic()  # 刷新写入时间戳
 
     async def _whitelist_check(self, event: AstrMessageEvent) -> bool:
         """
@@ -489,6 +502,15 @@ class DnDDicePlugin(Star):
         # 前缀长度校验
         if len(arg) > 5:
             yield event.plain_result("前缀过长，建议使用 1~2 个字符（如 . 或 !!）。")
+            return
+
+        # 拒绝与系统命令前缀 '/' 相同的前缀——路由层明确忽略它，
+        # 设置后自定义路由不会生效，形成"可设置但不可用"的逻辑陷阱。
+        if arg == "/":
+            yield event.plain_result(
+                "前缀 '/' 与系统命令前缀冲突，设置后自定义路由不会生效，"
+                "请选择其他符号（如 . ! ~ !!）。"
+            )
             return
 
         # 前缀字符集校验：不允许空白字符或字母，避免路由歧义和误触发。
