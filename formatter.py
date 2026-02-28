@@ -123,6 +123,16 @@ def _annotate_die(die: DieRoll, gr: DiceGroupResult) -> str:
     if die.state == "rerolled":
         return f"~{raw}~"
     if die.state == "exploded":
+        # 爆炸追加骰在成功计数模式下同样参与计数，展示时也应标注成功/失败标记。
+        if gr.is_success_mode and g.success_compare and g.success_value is not None:
+            if _cmp(die.value, g.success_compare, g.success_value):
+                raw = f"{raw}*"
+            elif (
+                g.failure_compare
+                and g.failure_value is not None
+                and _cmp(die.value, g.failure_compare, g.failure_value)
+            ):
+                raw = f"{raw}x"
         return f"{raw}!"
     # state 为 "kept"（保留）或 "dropped"（已丢弃）时到达此处
     if gr.is_success_mode and die.state == "kept":
@@ -205,6 +215,15 @@ def _format_dice_list(gr: DiceGroupResult) -> str:
 
     for val in extra_rolls:
         raw = _fate_str(val) if fate else str(val)
+        if gr.is_success_mode and g.success_compare and g.success_value is not None:
+            if _cmp(val, g.success_compare, g.success_value):
+                raw = f"{raw}*"
+            elif (
+                g.failure_compare
+                and g.failure_value is not None
+                and _cmp(val, g.failure_compare, g.failure_value)
+            ):
+                raw = f"{raw}x"
         display_parts.append(f"{raw}!")
 
     return "[" + ", ".join(display_parts) + "]"
