@@ -93,6 +93,22 @@ class ParsedExpression:
 # 平坦整数 token（用于位置感知匹配）
 _INT_TOKEN_RE = re.compile(r"\d+")
 
+# 全角 → ASCII 转换表：防止全角符号（如 ＋）被误判为非 ASCII 标签分隔符
+_FULLWIDTH_TABLE = str.maketrans(
+    "＋－＊／（）０１２３４５６７８９",
+    "+-*/()" + "0123456789",
+)
+
+
+def _normalize_fullwidth(s: str) -> str:
+    """
+    将常见全角算术字符规范化为 ASCII 等价形式。
+
+    例如：用户输入 d20＋5，＋（U+FF0B）属非 ASCII，不进行此归一化则
+    _strip_label 会在 ＋ 处截断，把 "+5" 误判成标签而改变掷骰逻辑。
+    """
+    return s.translate(_FULLWIDTH_TABLE)
+
 
 def _read_int(s: str, pos: int) -> tuple[int | None, int]:
     """尝试在 pos 处读取非负整数，返回 (value, new_pos) 或 (None, pos)。"""
@@ -122,11 +138,162 @@ def _read_compare_point(s: str, pos: int) -> tuple[str | None, int | None, int]:
     return compare, val, new_pos
 
 
+# ---------------------------------------------------------------------------
+# 骰子 token 子解析器（各负责一类修饰，就地修改 DiceGroup）
+# ---------------------------------------------------------------------------
+
+
+def _parse_keep_drop(expr: str, pos: int, group: DiceGroup) -> int:
+    """
+    解析可选的 keep / drop / adv / dis 修饰符，就地更新 group。
+
+    支持：kh / kl / k（保留）、dh / dl / d（丢弃）、adv / dis 语法糖。
+    """
+    n = len(expr)
+    if pos >= n:
+        return pos
+    ch = expr[pos].lower()
+    if ch == "k":
+        pos += 1
+        if pos < n and expr[pos].lower() == "h":
+            pos += 1
+            kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+            group.keep_mode = "kh"
+            group.keep_n = kn if kn is not None else 1
+        elif pos < n and expr[pos].lower() == "l":
+            pos += 1
+            kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+            group.keep_mode = "kl"
+            group.keep_n = kn if kn is not None else 1
+        else:
+            kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+            group.keep_mode = "kh"
+            group.keep_n = kn if kn is not None else 1
+    elif ch == "d":
+        # 先检查 'dis' 语法糖，避免被 drop 分支误匹配
+        if pos + 3 <= n and expr[pos : pos + 3].lower() == "dis":
+            group.count = 2
+            group.keep_mode = "kl"
+            group.keep_n = 1
+            pos += 3
+        else:
+            # 丢弃：需要 dl/dh/d(数字) 三种情况
+            # 避免误把下一骰组的 'd' 消耗掉：必须有 h/l 或紧跟数字
+            peek = pos + 1
+            if peek < n and expr[peek].lower() == "h":
+                pos += 2
+                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.drop_mode = "dh"
+                group.drop_n = dn if dn is not None else 1
+            elif peek < n and expr[peek].lower() == "l":
+                pos += 2
+                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.drop_mode = "dl"
+                group.drop_n = dn if dn is not None else 1
+            elif peek < n and expr[peek].isdigit():
+                pos += 1
+                dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
+                group.drop_mode = "dl"  # 'd' 简写 = dl（丢弃最低，与 Roll20 一致）
+                group.drop_n = dn if dn is not None else 1
+            # else: 不是丢弃修饰 → 不消耗
+    elif expr[pos : pos + 3].lower() == "adv":
+        group.count = 2
+        group.keep_mode = "kh"
+        group.keep_n = 1
+        pos += 3
+    return pos
+
+
+def _parse_exploding(expr: str, pos: int, group: DiceGroup) -> int:
+    """解析可选的爆炸修饰（!、!!、!p）及自定义爆炸阈值，就地更新 group。"""
+    n = len(expr)
+    if pos >= n or expr[pos] != "!":
+        return pos
+    group.exploding = True
+    pos += 1
+    if pos < n and expr[pos] == "!":
+        group.explode_mode = "compound"
+        pos += 1
+    elif pos < n and expr[pos].lower() == "p":
+        group.explode_mode = "penetrate"
+        pos += 1
+    else:
+        group.explode_mode = "standard"
+    # 可选自定义爆炸 ComparePoint
+    if pos < n and (expr[pos] in (">", "<", "=") or expr[pos].isdigit()):
+        cmp, val, pos = _read_compare_point(expr, pos)
+        group.explode_compare = cmp
+        group.explode_value = val
+    return pos
+
+
+def _parse_success_failure(expr: str, pos: int, group: DiceGroup) -> int:
+    """解析可选的成功计数（>N、<N）和失败计数（fN）修饰，就地更新 group。"""
+    n = len(expr)
+    if pos >= n or expr[pos] not in (">", "<"):
+        return pos
+    cmp, val, new_pos = _read_compare_point(expr, pos)
+    if val is None:
+        return pos
+    group.success_compare = cmp
+    group.success_value = val
+    pos = new_pos
+    # 可选失败计数（f[>|<|=]N）
+    if pos < n and expr[pos].lower() == "f":
+        pos += 1
+        f_cmp, f_val, new_pos2 = _read_compare_point(expr, pos)
+        if f_val is not None:
+            group.failure_compare = f_cmp
+            group.failure_value = f_val
+            pos = new_pos2
+        else:
+            pos -= 1  # 'f' 后无数字 → 退回
+    return pos
+
+
+def _parse_reroll(expr: str, pos: int, group: DiceGroup) -> int:
+    """解析可重复的重骰修饰（r 和 ro），就地向 group.reroll_conditions 追加条件。"""
+    n = len(expr)
+    while pos < n and expr[pos].lower() == "r":
+        once = False
+        pos += 1
+        if pos < n and expr[pos].lower() == "o":
+            once = True
+            pos += 1
+        cmp, val, new_pos = _read_compare_point(expr, pos)
+        if val is None:
+            cmp, val = "=", 1  # 默认：重骰 =1
+        else:
+            pos = new_pos
+        group.reroll_conditions.append(
+            RerollCondition(compare=cmp, value=val, once=once)
+        )
+    return pos
+
+
+def _parse_sort(expr: str, pos: int, group: DiceGroup) -> int:
+    """解析可选的排序修饰（s / sa / sd），就地更新 group。"""
+    n = len(expr)
+    if pos >= n or expr[pos].lower() != "s":
+        return pos
+    pos += 1
+    if pos < n and expr[pos].lower() == "d":
+        group.sort_order = "desc"
+        pos += 1
+    elif pos < n and expr[pos].lower() == "a":
+        group.sort_order = "asc"
+        pos += 1
+    else:
+        group.sort_order = "asc"  # 默认升序
+    return pos
+
+
 def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
     """
     从 expr[pos] 起尝试解析一个骰子 token。
 
     返回 (DiceGroup, new_pos) 或 (None, pos)（未能匹配时）。
+    内部依次调用五个独立子解析器处理各类修饰符。
     """
     start = pos
     n = len(expr)
@@ -144,15 +311,12 @@ def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
     fate = False
     sides = 0
     if pos < n and expr[pos].lower() == "f":
-        # 确保 F 后面不是数字（否则可能是 d4f1 这样的失败修饰）
-        # 实际上 dF 的 F 必须紧跟骰面位置，所以这里优先判断
         fate = True
         sides = 0
         pos += 1
     else:
         sides_val, pos2 = _read_int(expr, pos)
         if sides_val is None:
-            # 'd' 后面没有数字 → 无法解析
             return None, start
         sides = sides_val
         pos = pos2
@@ -160,129 +324,12 @@ def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
     count = count_val if count_val is not None else 1
     group = DiceGroup(count=count, sides=sides, fate=fate)
 
-    # 4. 保留/丢弃修饰（优先于爆炸，顺序：kh/kl/k、dh/dl/d）
-    #    注意："d" 是丢弃简写，但要先检查后面是否有 h/l 区分 dh/dl
-    #    另需避免与骰子数量的 'd' 混淆 → 只有已成功匹配骰子后才匹配
-    if pos < n:
-        ch = expr[pos].lower()
-        # keep
-        if ch == "k":
-            pos += 1
-            if pos < n and expr[pos].lower() == "h":
-                pos += 1
-                kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                group.keep_mode = "kh"
-                group.keep_n = kn if kn is not None else 1
-            elif pos < n and expr[pos].lower() == "l":
-                pos += 1
-                kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                group.keep_mode = "kl"
-                group.keep_n = kn if kn is not None else 1
-            else:
-                # 'k' 单独 = kh
-                kn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                group.keep_mode = "kh"
-                group.keep_n = kn if kn is not None else 1
-        elif ch == "d":
-            # 先检查 'dis' 语法糖，避免被 drop 分支误匹配
-            if pos + 3 <= n and expr[pos : pos + 3].lower() == "dis":
-                group.count = 2
-                group.keep_mode = "kl"
-                group.keep_n = 1
-                pos += 3
-            else:
-                # 丢弃：需要 dl/dh/d(数字) 三种情况
-                # 避免误把下一骰组的 'd' 消耗掉：必须有 h/l 或紧跟数字
-                peek = pos + 1
-                if peek < n and expr[peek].lower() == "h":
-                    pos += 2  # consume 'd' + 'h'
-                    dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                    group.drop_mode = "dh"
-                    group.drop_n = dn if dn is not None else 1
-                elif peek < n and expr[peek].lower() == "l":
-                    pos += 2  # consume 'd' + 'l'
-                    dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                    group.drop_mode = "dl"
-                    group.drop_n = dn if dn is not None else 1
-                elif peek < n and expr[peek].isdigit():
-                    pos += 1  # consume 'd'
-                    dn, pos = _read_int(expr, pos)  # type: ignore[assignment]
-                    group.drop_mode = "dl"  # 'd' 简写 = dl（丢弃最低，与 Roll20 一致）
-                    group.drop_n = dn if dn is not None else 1
-                # else: 不是丢弃修饰，可能是下一骰组的开始 → 不消耗
-        # adv 语法糖（dis 已在 ch == "d" 分支内处理）
-        elif expr[pos : pos + 3].lower() == "adv":
-            group.count = 2
-            group.keep_mode = "kh"
-            group.keep_n = 1
-            pos += 3
-
-    # 5. 爆炸修饰：!! > !p > !
-    if pos < n and expr[pos] == "!":
-        group.exploding = True
-        pos += 1
-        if pos < n and expr[pos] == "!":
-            group.explode_mode = "compound"
-            pos += 1
-        elif pos < n and expr[pos].lower() == "p":
-            group.explode_mode = "penetrate"
-            pos += 1
-        else:
-            group.explode_mode = "standard"
-        # 可选自定义爆炸 ComparePoint
-        if pos < n and (expr[pos] in (">", "<", "=") or expr[pos].isdigit()):
-            cmp, val, pos = _read_compare_point(expr, pos)
-            group.explode_compare = cmp
-            group.explode_value = val
-
-    # 6. 成功计数 ComparePoint（>N 或 <N）
-    if pos < n and expr[pos] in (">", "<"):
-        cmp, val, new_pos = _read_compare_point(expr, pos)
-        if val is not None:
-            group.success_compare = cmp
-            group.success_value = val
-            pos = new_pos
-
-            # 6a. 失败计数（f[>|<|=]N）
-            if pos < n and expr[pos].lower() == "f":
-                pos += 1
-                f_cmp, f_val, new_pos2 = _read_compare_point(expr, pos)
-                if f_val is not None:
-                    group.failure_compare = f_cmp
-                    group.failure_value = f_val
-                    pos = new_pos2
-                else:
-                    # 'f' 后没有数字 → 退回
-                    pos -= 1
-
-    # 7. 重骰修饰（r / ro，可重复）
-    while pos < n and expr[pos].lower() == "r":
-        once = False
-        pos += 1
-        if pos < n and expr[pos].lower() == "o":
-            once = True
-            pos += 1
-        cmp, val, new_pos = _read_compare_point(expr, pos)
-        if val is None:
-            # 'r' 后无 ComparePoint → 默认 =1（重骰 1）
-            cmp, val = "=", 1
-        else:
-            pos = new_pos
-        group.reroll_conditions.append(
-            RerollCondition(compare=cmp, value=val, once=once)
-        )
-
-    # 8. 排序修饰（s / sa / sd）
-    if pos < n and expr[pos].lower() == "s":
-        pos += 1
-        if pos < n and expr[pos].lower() == "d":
-            group.sort_order = "desc"
-            pos += 1
-        elif pos < n and expr[pos].lower() == "a":
-            group.sort_order = "asc"
-            pos += 1
-        else:
-            group.sort_order = "asc"  # 默认升序
+    # 4–8. 依次应用各类修饰（每个函数就地修改 group 并返回更新后的 pos）
+    pos = _parse_keep_drop(expr, pos, group)
+    pos = _parse_exploding(expr, pos, group)
+    pos = _parse_success_failure(expr, pos, group)
+    pos = _parse_reroll(expr, pos, group)
+    pos = _parse_sort(expr, pos, group)
 
     return group, pos
 
@@ -304,6 +351,7 @@ def _strip_label(raw: str) -> tuple[str, str]:
     返回 (expression_part, label_part)。
     """
     raw = raw.strip()
+    raw = _normalize_fullwidth(raw)
 
     # 1. '#' 强制分隔符。
     if "#" in raw:
