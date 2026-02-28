@@ -369,9 +369,12 @@ def _strip_label(raw: str) -> tuple[str, str]:
 
     分离策略（优先级从高到低）：
       1. '#' 强制分隔符，优先处理。
-      2. 在首个非 ASCII *字母* 字符处截断（Unicode 类别 L*，如 CJK、假名；
-         非 ASCII 标点/符号不触发）——兼容『d20 感知 15』、
-         『2d6 + 1d4 伤害』（先找非 ASCII 再处理空格，避免算式空格误判为标签）。
+      2. 在首个非 ASCII *字母或 So 类符号* 字符处截断——兼容
+         『d20 感知 15』、『1d8+2💥』等。
+         - L*（CJK、假名等自然语言字符）：无条件截断。
+         - So（Emoji 及杂项符号）：无条件截断。
+         - Sm/Sc/Sk（数学/货币/修饰符号）：仅在前有空白时截断，
+           避免将粘贴进来的 Unicode 运算符（如 ×、÷）静默丢弃。
       3. 以第一个空白字符切分：
          a. 若空白后紧跟 +/- 运算符，整体去空格视为纯算式，无标签。
          b. 否则按空白切分——兼容『d20 感知 15』（纯 ASCII 标签）。
@@ -388,19 +391,26 @@ def _strip_label(raw: str) -> tuple[str, str]:
         parts = raw.split("#", 1)
         return parts[0].strip(), parts[1].strip()
 
-    # 2. 在首个非 ASCII *字母またはシンボル* 字符处截断（此步须在空白检测之前，
+    # 2. 在首个非 ASCII *字母或 So 类符号* 字符处截断（此步须在空白检测之前，
     #    否则 '2d6 + 1d4 伤害' 会在第一个空格处就被截断）。
     #    触发截断的 Unicode 类别：
     #      - L*（Lu/Ll/Lt/Lm/Lo）：自然语言文字，如 CJK 汉字、假名、西里尔字母
-    #      - S*（Sm/Sc/Sk/So）：符号类，涵盖 Emoji（通常为 So）及数学符号等
-    #    不触发截断：非 ASCII 标点/分隔符（P*、Z*），避免对含有此类字符的
-    #    算式（如带 em-dash 的表达式）进行误分割。
-    # 注意：若未来表达式语法扩展至含非 ASCII 标识符，需在此处添加白名单豁免。
+    #        ──无论位置，立即视为标签起点。
+    #      - So（Other Symbol）：Emoji 及其他杂项符号（箭头、花饰等）
+    #        ──同 L* 无条件截断；用户通常以 Emoji 作为装饰性标签。
+    #    不触发无条件截断：
+    #      - Sm（Math Symbol，如 ×、÷、√、≤）、Sc（Currency）、Sk（Modifier）
+    #        ──仅在前有空白时才截断，避免将粘贴进表达式的 Unicode 数学运算符
+    #        静默丢弃（旧行为），改为保留完整输入让解析器给出明确报错。
+    #      - P*（标点）、Z*（分隔符）：不触发截断。
     for i, ch in enumerate(raw):
         if ord(ch) > 0x7F:
             cat = unicodedata.category(ch)
-            if cat.startswith("L") or cat.startswith("S"):
+            if cat.startswith("L") or cat == "So":
                 return raw[:i].strip(), raw[i:].strip()
+            # Sm / Sc / Sk 仅在前有空白时才作为标签起点。
+            if cat.startswith("S") and i > 0 and raw[i - 1].isspace():
+                return raw[: i - 1].strip(), raw[i:].strip()
 
     # 3. 以第一个空白字符切分（纯 ASCII 输入）。
     ws_match = re.search(r"\s", raw)
