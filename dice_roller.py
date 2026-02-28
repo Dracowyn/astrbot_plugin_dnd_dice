@@ -19,6 +19,19 @@ from .dice_parser import DiceGroup, ParsedExpression, RerollCondition
 
 _FATE_VALUES = (-1, 0, 1)  # FATE 骰面
 
+# Module-level SystemRandom instance for better randomness.
+# SystemRandom uses the OS CSPRNG (e.g. /dev/urandom on Linux) instead of the
+# deterministic Mersenne Twister, making dice rolls unpredictable in practice.
+_rng = random.SystemRandom()
+
+
+@dataclass
+class DieRoll:
+    """单枚骰子的带状态注解结果。"""
+
+    value: int
+    state: str  # "kept" | "dropped" | "rerolled" | "exploded"
+
 
 @dataclass
 class DiceGroupResult:
@@ -33,6 +46,12 @@ class DiceGroupResult:
     negated: bool = False  # 该组前缀为 '-' 时为 True
     successes: int | None = None  # 目标数成功计数（None = 非计数模式）
     failures: int | None = None  # 失败计数（None = 未启用）
+    # Per-roll annotated results (populated by the roller for accurate display).
+    # Each element corresponds to a single die event in chronological order,
+    # including rerolled-away originals, final kept/dropped values, and
+    # exploded extras. The formatter uses this when available instead of the
+    # legacy frequency-counting approach.
+    die_rolls: list[DieRoll] = field(default_factory=list)
 
     @property
     def is_success_mode(self) -> bool:
@@ -164,11 +183,11 @@ def _should_explode(value: int, sides: int, group: DiceGroup) -> bool:
 
 
 def _roll_single(sides: int) -> int:
-    return random.randint(1, sides)
+    return _rng.randint(1, sides)
 
 
 def _roll_fate() -> int:
-    return random.choice(_FATE_VALUES)  # type: ignore[arg-type]
+    return _rng.choice(_FATE_VALUES)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -200,41 +219,182 @@ def _apply_rerolls(
     conditions: list[RerollCondition],
     max_depth: int,
     fate: bool,
-) -> tuple[list[int], list[int]]:
+) -> tuple[list[int], list[int], list[list[tuple[int, str]]]]:
     """
     对 raw_rolls 中满足条件的骰子执行重骰。
 
-    返回 (final_rolls, rerolled_originals)。
-    rerolled_originals 记录被替换掉的原始值（展示用）。
+    返回 (final_rolls, rerolled_originals, per_slot_histories)。
+      - final_rolls: 重骰后的最终值列表
+      - rerolled_originals: 被替换掉的原始值（向后兼容用）
+      - per_slot_histories: 每个位置的骰骰历史记录。
+        历史记录是 (value, state) 元组的列表，其中 state 为
+        "rerolled"（被替换的原始值）或 "kept"（最终保留值，
+        keep/drop 阶段可能进一步改为 "dropped"）。
     """
     final: list[int] = []
     rerolled: list[int] = []
+    histories: list[list[tuple[int, str]]] = []
 
     for val in raw_rolls:
         original = val
+        history: list[tuple[int, str]] = []
 
         for cond in conditions:
             if _compare(val, cond.compare, cond.value):
                 rerolled.append(original)
+                history.append((original, "rerolled"))
                 if cond.once:
-                    # ro：只重骰一次
                     val = _roll_fate() if fate else _roll_single(sides)
                 else:
-                    # r：循环重骰直至不满足条件（或超深度）
                     depth = 0
                     while _compare(val, cond.compare, cond.value) and depth < max_depth:
                         val = _roll_fate() if fate else _roll_single(sides)
                         depth += 1
                 break  # 一个骰值只触发第一个匹配的条件
 
+        history.append((val, "kept"))  # state may be refined to "dropped" later
         final.append(val)
+        histories.append(history)
 
-    return final, rerolled
+    return final, rerolled, histories
 
 
 # ---------------------------------------------------------------------------
-# 核心掷骰逻辑
+# 核心掷骰逻辑（拆分为若干独立辅助函数，_roll_group 负责编排）
 # ---------------------------------------------------------------------------
+
+
+def _roll_base_dice(
+    group: DiceGroup,
+    sides: int,
+    exploding_depth: int,
+) -> list[int]:
+    """掷基础骰（不含重骰/keep/drop 等后处理）。"""
+    if group.fate:
+        return [_roll_fate() for _ in range(group.count)]
+    if group.exploding and group.explode_mode == "compound":
+        return [
+            _roll_compound_exploding(sides, group, exploding_depth)
+            for _ in range(group.count)
+        ]
+    return [_roll_single(sides) for _ in range(group.count)]
+
+
+def _explode_after_reroll(
+    group: DiceGroup,
+    sides: int,
+    raw_rolls: list[int],
+    exploding_depth: int,
+) -> list[int]:
+    """在重骰之后应用标准/穿透爆炸，返回追加骰列表（复合爆炸和 FATE 骰跳过）。"""
+    if not group.exploding or group.fate or group.explode_mode == "compound":
+        return []
+    exploded_extra: list[int] = []
+    if group.explode_mode == "penetrate":
+        for v in raw_rolls:
+            depth = 0
+            curr = v
+            while _should_explode(curr, sides, group) and depth < exploding_depth:
+                depth += 1
+                curr = max(1, _roll_single(sides) - 1)
+                exploded_extra.append(curr)
+    else:  # standard
+        for v in raw_rolls:
+            depth = 0
+            curr = v
+            while _should_explode(curr, sides, group) and depth < exploding_depth:
+                depth += 1
+                curr = _roll_single(sides)
+                exploded_extra.append(curr)
+    return exploded_extra
+
+
+def _apply_keep_drop_indexed(
+    raw_rolls: list[int],
+    exploded_extra: list[int],
+    group: DiceGroup,
+    effective_keep_mode: str | None,
+    effective_keep_n: int | None,
+) -> tuple[list[int], list[int], set[int]]:
+    """
+    基于位置索引的 keep / drop 过滤。
+
+    返回 (kept_vals, dropped_vals, dropped_positions_in_raw)。
+    dropped_positions_in_raw 是 raw_rolls 中被丢弃的位置集合，使 _build_die_rolls
+    能精确标注每颗骰子的状态，避免因重复值引起的顺序错乱。
+    """
+    if not effective_keep_mode or effective_keep_n is None:
+        return list(raw_rolls) + list(exploded_extra), [], set()
+
+    # 爆炸骰 + keep：将追加骰纳入竞争池
+    pool = (
+        raw_rolls + exploded_extra
+        if group.exploding and exploded_extra and group.explode_mode != "compound"
+        else raw_rolls
+    )
+
+    indexed = list(enumerate(pool))
+    sorted_desc = sorted(indexed, key=lambda x: x[1], reverse=True)
+    kn = max(0, min(effective_keep_n, len(pool)))
+
+    if effective_keep_mode == "kh":
+        kept_indices = {idx for idx, _ in sorted_desc[:kn]}
+    else:  # kl
+        kept_indices = {idx for idx, _ in sorted_desc[len(pool) - kn :]}
+
+    # dropped_positions only tracks indices within raw_rolls (0‥len(raw_rolls)-1)
+    dropped_positions_in_raw = {i for i in range(len(raw_rolls)) if i not in kept_indices}
+
+    kept_vals = [pool[i] for i in range(len(pool)) if i in kept_indices]
+    dropped_vals = [pool[i] for i in range(len(pool)) if i not in kept_indices]
+    return kept_vals, dropped_vals, dropped_positions_in_raw
+
+
+def _count_successes(
+    kept_vals: list[int],
+    group: DiceGroup,
+) -> tuple[int | None, int | None]:
+    """计算 kept_vals 中的成功数和失败数（均为 None 表示非成功计数模式）。"""
+    if group.success_compare is None or group.success_value is None:
+        return None, None
+    successes = sum(
+        1 for v in kept_vals if _compare(v, group.success_compare, group.success_value)
+    )
+    failures: int | None = None
+    if group.failure_compare is not None and group.failure_value is not None:
+        failures = sum(
+            1
+            for v in kept_vals
+            if _compare(v, group.failure_compare, group.failure_value)
+        )
+    return successes, failures
+
+
+def _build_die_rolls(
+    raw_rolls: list[int],
+    exploded_extra: list[int],
+    per_slot_histories: list[list[tuple[int, str]]],
+    dropped_positions_in_raw: set[int],
+) -> list[DieRoll]:
+    """
+    将每颗骰子的历史记录和最终状态合并为有序 DieRoll 列表。
+
+    列表顺序与投掷顺序一致，被重骰的原始值以 state="rerolled" 出现在
+    其替代值之前，被丢弃的最终值以 state="dropped" 标注，爆炸追加骰
+    以 state="exploded" 追加在末尾。
+    """
+    die_rolls: list[DieRoll] = []
+    for i, history in enumerate(per_slot_histories):
+        # 历史中除最后一项外均为被替换的原始值（state="rerolled"）
+        for val, state in history[:-1]:
+            die_rolls.append(DieRoll(value=val, state=state))
+        # 最后一项是最终值；keep/drop 阶段决定其最终状态
+        final_val, _ = history[-1]
+        final_state = "dropped" if i in dropped_positions_in_raw else "kept"
+        die_rolls.append(DieRoll(value=final_val, state=final_state))
+    for val in exploded_extra:
+        die_rolls.append(DieRoll(value=val, state="exploded"))
+    return die_rolls
 
 
 def _roll_group(
@@ -244,7 +404,7 @@ def _roll_group(
     exploding_depth: int,
     reroll_max_depth: int = 20,
 ) -> DiceGroupResult:
-    """掷一组骰子并返回结果。"""
+    """掷一组骰子并返回结果（编排各辅助函数）。"""
     if group.count > max_dice:
         raise DiceRollError(f"骰子数量 {group.count} 超过最大限制 {max_dice}")
     if not group.fate and group.sides > max_sides:
@@ -255,28 +415,19 @@ def _roll_group(
         raise DiceRollError(f"骰子数量必须至少为 1，得到 {group.count}")
 
     negated = group.modifier == -1
-    exploded_extra: list[int] = []
     sides = group.sides
 
-    # --- 1. 基础掷骰（复合爆炸原子化；其他模式仅掷基础骰，爆炸在重骰后应用）---
-    if group.fate:
-        # FATE/Fudge 骰：三面 -1/0/1
-        raw_rolls = [_roll_fate() for _ in range(group.count)]
-    elif group.exploding and group.explode_mode == "compound":
-        # 复合爆炸：整条链返回单值，不存在"先重骰再爆炸"的分离需求
-        raw_rolls = [
-            _roll_compound_exploding(sides, group, exploding_depth)
-            for _ in range(group.count)
-        ]
-    else:
-        # 标准/穿透爆炸或普通骰：仅掷基础值，爆炸追加在重骰完成后处理
-        raw_rolls = [_roll_single(sides) for _ in range(group.count)]
+    # --- 1. 基础掷骰 ---
+    raw_rolls = _roll_base_dice(group, sides, exploding_depth)
 
-    # --- 2. 重骰（在爆炸之前应用，reroll_max_depth 独立于 exploding_depth）---
+    # --- 2. 重骰（在爆炸之前应用）---
     rerolled_originals: list[int] = []
+    per_slot_histories: list[list[tuple[int, str]]] = [
+        [(v, "kept")] for v in raw_rolls
+    ]
     if group.reroll_conditions:
         effective_sides = sides if not group.fate else 0
-        raw_rolls, rerolled_originals = _apply_rerolls(
+        raw_rolls, rerolled_originals, per_slot_histories = _apply_rerolls(
             raw_rolls,
             effective_sides,
             group.reroll_conditions,
@@ -284,49 +435,27 @@ def _roll_group(
             group.fate,
         )
 
-    # --- 3. 重骰完成后应用爆炸（复合爆炸和 FATE 骰无此阶段）---
-    if group.exploding and not group.fate and group.explode_mode != "compound":
-        exploded_extra = []
-        if group.explode_mode == "penetrate":
-            for v in raw_rolls:
-                depth = 0
-                curr = v
-                while _should_explode(curr, sides, group) and depth < exploding_depth:
-                    depth += 1
-                    curr = max(1, _roll_single(sides) - 1)
-                    exploded_extra.append(curr)
-        else:  # standard
-            for v in raw_rolls:
-                depth = 0
-                curr = v
-                while _should_explode(curr, sides, group) and depth < exploding_depth:
-                    depth += 1
-                    curr = _roll_single(sides)
-                    exploded_extra.append(curr)
+    # --- 3. 爆炸（重骰完成后应用；复合爆炸和 FATE 骰跳过）---
+    exploded_extra = _explode_after_reroll(group, sides, raw_rolls, exploding_depth)
 
-        # --- 3a. 对爆炸追加骰也应用重骰规则（Roll20 规范：重骰作用于所有已落定的骰子）---
-        # 追加骰不再触发二次爆炸（pragmatic limit，避免无限递归）
-        if group.reroll_conditions and exploded_extra:
-            extra_effective_sides = sides if not group.fate else 0
-            exploded_extra, extra_rerolled = _apply_rerolls(
-                exploded_extra,
-                extra_effective_sides,
-                group.reroll_conditions,
-                reroll_max_depth,
-                group.fate,
-            )
-            rerolled_originals.extend(extra_rerolled)
+    # 对爆炸追加骰也应用重骰规则（Roll20 规范），追加骰历史不纳入主体
+    if group.reroll_conditions and exploded_extra:
+        extra_effective_sides = sides if not group.fate else 0
+        exploded_extra, extra_rerolled, _ = _apply_rerolls(
+            exploded_extra,
+            extra_effective_sides,
+            group.reroll_conditions,
+            reroll_max_depth,
+            group.fate,
+        )
+        rerolled_originals.extend(extra_rerolled)
 
     all_rolls = raw_rolls + exploded_extra
 
-    # --- 4. Keep / Drop 过滤 ---
-    # 先把 drop 路径转换为等价的 keep 路径再统一处理
+    # --- 4. Keep / Drop（转换 drop → keep 后统一走索引路径）---
     effective_keep_mode = group.keep_mode
     effective_keep_n = group.keep_n
-
     if group.drop_mode is not None and group.drop_n is not None:
-        # dl（丢弃最低）→ 等价于 kh(count - drop_n)
-        # dh（丢弃最高）→ 等价于 kl(count - drop_n)
         dn = min(group.drop_n, len(raw_rolls))
         if group.drop_mode == "dl":
             effective_keep_mode = "kh"
@@ -335,29 +464,9 @@ def _roll_group(
             effective_keep_mode = "kl"
             effective_keep_n = len(raw_rolls) - dn
 
-    if effective_keep_mode and effective_keep_n is not None:
-        kn = max(0, min(effective_keep_n, len(raw_rolls)))
-        sorted_desc = sorted(raw_rolls, reverse=True)
-        if effective_keep_mode == "kh":
-            kept_vals = sorted_desc[:kn]
-            dropped_vals = sorted_desc[kn:]
-        else:  # kl
-            kept_vals = sorted_desc[len(sorted_desc) - kn :]
-            dropped_vals = sorted_desc[: len(sorted_desc) - kn]
-
-        # 爆炸骰 + keep 时：追加骰也纳入排序池
-        if group.exploding and exploded_extra and group.explode_mode != "compound":
-            combined = sorted(raw_rolls + exploded_extra, reverse=True)
-            if effective_keep_mode == "kh":
-                kept_vals = combined[:kn]
-                dropped_vals = combined[kn:]
-            else:
-                kept_vals = combined[len(combined) - kn :]
-                dropped_vals = combined[: len(combined) - kn]
-    else:
-        # 无 keep/drop 过滤：全部骰子计入
-        kept_vals = list(all_rolls)
-        dropped_vals = []
+    kept_vals, dropped_vals, dropped_positions = _apply_keep_drop_indexed(
+        raw_rolls, exploded_extra, group, effective_keep_mode, effective_keep_n
+    )
 
     # --- 5. 排序（仅影响展示顺序）---
     if group.sort_order == "asc":
@@ -365,8 +474,6 @@ def _roll_group(
     elif group.sort_order == "desc":
         kept_vals = sorted(kept_vals, reverse=True)
 
-    # Rebuild all_rolls so the formatter displays dice in the correct sorted order.
-    # Only applies when there are no exploded extras (to avoid double-counting).
     if group.sort_order is not None and not exploded_extra:
         dropped_sorted = sorted(dropped_vals, reverse=(group.sort_order == "desc"))
         all_rolls = sorted(
@@ -374,20 +481,12 @@ def _roll_group(
         )
 
     # --- 6. 成功/失败计数 ---
-    successes: int | None = None
-    failures: int | None = None
-    if group.success_compare is not None and group.success_value is not None:
-        successes = sum(
-            1
-            for v in kept_vals
-            if _compare(v, group.success_compare, group.success_value)
-        )
-        if group.failure_compare is not None and group.failure_value is not None:
-            failures = sum(
-                1
-                for v in kept_vals
-                if _compare(v, group.failure_compare, group.failure_value)
-            )
+    successes, failures = _count_successes(kept_vals, group)
+
+    # --- 7. 构建带状态的 DieRoll 列表（供 formatter 精确标注每颗骰子）---
+    die_rolls = _build_die_rolls(
+        raw_rolls, exploded_extra, per_slot_histories, dropped_positions
+    )
 
     return DiceGroupResult(
         group=group,
@@ -399,6 +498,7 @@ def _roll_group(
         negated=negated,
         successes=successes,
         failures=failures,
+        die_rolls=die_rolls,
     )
 
 
