@@ -19,9 +19,9 @@ from .dice_parser import DiceGroup, ParsedExpression, RerollCondition
 
 _FATE_VALUES = (-1, 0, 1)  # FATE 骰面
 
-# Module-level SystemRandom instance for better randomness.
-# SystemRandom uses the OS CSPRNG (e.g. /dev/urandom on Linux) instead of the
-# deterministic Mersenne Twister, making dice rolls unpredictable in practice.
+# 模块级 SystemRandom 实例，提供更高质量的随机数。
+# SystemRandom 使用操作系统 CSPRNG（如 Linux 的 /dev/urandom），
+# 而非确定性的梅森旋转算法，确保掷骰结果在实际使用中不可预测。
 _rng = random.SystemRandom()
 
 
@@ -46,11 +46,9 @@ class DiceGroupResult:
     negated: bool = False  # 该组前缀为 '-' 时为 True
     successes: int | None = None  # 目标数成功计数（None = 非计数模式）
     failures: int | None = None  # 失败计数（None = 未启用）
-    # Per-roll annotated results (populated by the roller for accurate display).
-    # Each element corresponds to a single die event in chronological order,
-    # including rerolled-away originals, final kept/dropped values, and
-    # exploded extras. The formatter uses this when available instead of the
-    # legacy frequency-counting approach.
+    # 每颗骰子的带状态注解结果（由执行引擎填充，供格式化器精确展示）。
+    # 列表按投掷时间顺序排列，包含被重骰替换的原始值、最终保留/丢弃值
+    # 以及爆炸追加骰。格式化器优先使用此列表，而非基于频率计数的旧路径。
     die_rolls: list[DieRoll] = field(default_factory=list)
 
     @property
@@ -252,7 +250,7 @@ def _apply_rerolls(
                         depth += 1
                 break  # 一个骰值只触发第一个匹配的条件
 
-        history.append((val, "kept"))  # state may be refined to "dropped" later
+        history.append((val, "kept"))  # 状态在后续 keep/drop 阶段可能进一步改为 "dropped"
         final.append(val)
         histories.append(history)
 
@@ -319,9 +317,10 @@ def _apply_keep_drop_indexed(
     """
     基于位置索引的 keep / drop 过滤。
 
-    返回 (kept_vals, dropped_vals, dropped_positions_in_raw)。
-    dropped_positions_in_raw 是 raw_rolls 中被丢弃的位置集合，使 _build_die_rolls
-    能精确标注每颗骰子的状态，避免因重复值引起的顺序错乱。
+    返回 (kept_vals, dropped_vals, dropped_positions)。
+    dropped_positions 是合并池（raw_rolls + exploded_extra）中被丢弃的位置集合，
+    使 _build_die_rolls 能精确标注每颢骰子的状态，包括被丢弃的爆炸追加骰
+    （这些应标注 state="dropped"，而非 state="exploded"）。
     """
     if not effective_keep_mode or effective_keep_n is None:
         return list(raw_rolls) + list(exploded_extra), [], set()
@@ -342,12 +341,14 @@ def _apply_keep_drop_indexed(
     else:  # kl
         kept_indices = {idx for idx, _ in sorted_desc[len(pool) - kn :]}
 
-    # dropped_positions only tracks indices within raw_rolls (0‥len(raw_rolls)-1)
-    dropped_positions_in_raw = {i for i in range(len(raw_rolls)) if i not in kept_indices}
+    # 跟踪完整池（基础骰 + 爆炸追加骰）中所有被丢弃的位置索引，
+    # 以便 _build_die_rolls 将被丢弃的爆炸追加骰正确标注为 "dropped"
+    # 而非 "exploded"。
+    dropped_positions = {i for i in range(len(pool)) if i not in kept_indices}
 
     kept_vals = [pool[i] for i in range(len(pool)) if i in kept_indices]
     dropped_vals = [pool[i] for i in range(len(pool)) if i not in kept_indices]
-    return kept_vals, dropped_vals, dropped_positions_in_raw
+    return kept_vals, dropped_vals, dropped_positions
 
 
 def _count_successes(
@@ -374,7 +375,7 @@ def _build_die_rolls(
     raw_rolls: list[int],
     exploded_extra: list[int],
     per_slot_histories: list[list[tuple[int, str]]],
-    dropped_positions_in_raw: set[int],
+    dropped_positions: set[int],
 ) -> list[DieRoll]:
     """
     将每颗骰子的历史记录和最终状态合并为有序 DieRoll 列表。
@@ -382,6 +383,9 @@ def _build_die_rolls(
     列表顺序与投掷顺序一致，被重骰的原始值以 state="rerolled" 出现在
     其替代值之前，被丢弃的最终值以 state="dropped" 标注，爆炸追加骰
     以 state="exploded" 追加在末尾。
+
+    dropped_positions 包含合并池（raw_rolls + exploded_extra）中所有被丢弃位置的索引。
+    爆炸追加骰在池中的索引为 len(raw_rolls) + j。
     """
     die_rolls: list[DieRoll] = []
     for i, history in enumerate(per_slot_histories):
@@ -390,10 +394,14 @@ def _build_die_rolls(
             die_rolls.append(DieRoll(value=val, state=state))
         # 最后一项是最终值；keep/drop 阶段决定其最终状态
         final_val, _ = history[-1]
-        final_state = "dropped" if i in dropped_positions_in_raw else "kept"
+        final_state = "dropped" if i in dropped_positions else "kept"
         die_rolls.append(DieRoll(value=final_val, state=final_state))
-    for val in exploded_extra:
-        die_rolls.append(DieRoll(value=val, state="exploded"))
+    for j, val in enumerate(exploded_extra):
+        # 爆炸追加骰也可能被 keep/drop 规则淘汰；
+        # 其在合并池中的索引为 len(raw_rolls) + j。
+        pool_idx = len(raw_rolls) + j
+        state = "dropped" if pool_idx in dropped_positions else "exploded"
+        die_rolls.append(DieRoll(value=val, state=state))
     return die_rolls
 
 
@@ -422,9 +430,7 @@ def _roll_group(
 
     # --- 2. 重骰（在爆炸之前应用）---
     rerolled_originals: list[int] = []
-    per_slot_histories: list[list[tuple[int, str]]] = [
-        [(v, "kept")] for v in raw_rolls
-    ]
+    per_slot_histories: list[list[tuple[int, str]]] = [[(v, "kept")] for v in raw_rolls]
     if group.reroll_conditions:
         effective_sides = sides if not group.fate else 0
         raw_rolls, rerolled_originals, per_slot_histories = _apply_rerolls(
@@ -456,13 +462,19 @@ def _roll_group(
     effective_keep_mode = group.keep_mode
     effective_keep_n = group.keep_n
     if group.drop_mode is not None and group.drop_n is not None:
-        dn = min(group.drop_n, len(raw_rolls))
+        # 计算实际竞争池大小：当爆炸追加骰被纳入 keep/drop 池时
+        # （与 _apply_keep_drop_indexed 中的条件相同），drop_n 须相对于
+        # 完整池进行截断和减法，而非仅基于 len(raw_rolls)。
+        pool_size = len(raw_rolls)
+        if group.exploding and exploded_extra and group.explode_mode != "compound":
+            pool_size += len(exploded_extra)
+        dn = min(group.drop_n, pool_size)
         if group.drop_mode == "dl":
             effective_keep_mode = "kh"
-            effective_keep_n = len(raw_rolls) - dn
+            effective_keep_n = pool_size - dn
         else:  # dh
             effective_keep_mode = "kl"
-            effective_keep_n = len(raw_rolls) - dn
+            effective_keep_n = pool_size - dn
 
     kept_vals, dropped_vals, dropped_positions = _apply_keep_drop_indexed(
         raw_rolls, exploded_extra, group, effective_keep_mode, effective_keep_n
