@@ -38,6 +38,7 @@ LLM 函数工具：
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 
 from astrbot.api import logger
@@ -157,10 +158,12 @@ class DnDDicePlugin(Star):
         # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
         self._character_manager: CharacterManager | None = None
 
-        # In-memory write-through cache for custom prefix per session origin.
+        # In-memory write-through LRU cache for custom prefix per session origin.
         # Avoids a KV lookup on every incoming message in custom_prefix_route.
         # Keys are unified_msg_origin strings; None means "no custom prefix set".
-        self._prefix_cache: dict[str, str | None] = {}
+        # OrderedDict preserves insertion-order, enabling O(1) LRU eviction via
+        # move_to_end() on hit and popitem(last=False) on capacity overflow.
+        self._prefix_cache: OrderedDict[str, str | None] = OrderedDict()
 
     @property
     def character_manager(self) -> CharacterManager:
@@ -200,13 +203,15 @@ class DnDDicePlugin(Star):
         """
         origin = event.unified_msg_origin
         if origin not in self._prefix_cache:
-            # Evict oldest entry when cache is full (insertion-order eviction).
+            # Evict the least-recently-used entry when the cache is full.
             if len(self._prefix_cache) >= _PREFIX_CACHE_MAX:
-                oldest = next(iter(self._prefix_cache))
-                del self._prefix_cache[oldest]
+                self._prefix_cache.popitem(last=False)
             kv_key = f"custom_prefix:{origin}"
             raw = await self.get_kv_data(kv_key, None)
             self._prefix_cache[origin] = str(raw) if raw is not None else None
+        else:
+            # Promote to most-recently-used position on cache hit.
+            self._prefix_cache.move_to_end(origin)
         cached = self._prefix_cache[origin]
         return cached if cached is not None else self.default_cmd_prefix
 
@@ -465,6 +470,7 @@ class DnDDicePlugin(Star):
         if arg.lower() in ("reset", "重置", "清除"):
             await self.delete_kv_data(key)
             self._prefix_cache[event.unified_msg_origin] = None  # write-through
+            self._prefix_cache.move_to_end(event.unified_msg_origin)  # promote to MRU
             if self.default_cmd_prefix:
                 yield event.plain_result(
                     f"已清除自定义骰子前缀设置，恢复为默认前缀 {self.default_cmd_prefix!r}。"
@@ -480,6 +486,7 @@ class DnDDicePlugin(Star):
 
         await self.put_kv_data(key, arg)
         self._prefix_cache[event.unified_msg_origin] = arg  # write-through
+        self._prefix_cache.move_to_end(event.unified_msg_origin)  # promote to MRU
         yield event.plain_result(
             f"已将自定义骰子前缀设为 {arg!r}。\n"
             f"现在可用 {arg}r、{arg}roll、{arg}dset 等触发骰子功能，\n"
@@ -496,6 +503,11 @@ class DnDDicePlugin(Star):
         """
         prefix = await self._get_effective_prefix(event)
         if not prefix:
+            return
+        # When the effective prefix equals the AstrBot system command prefix ("/"),
+        # the @filter.command handlers already process these messages.  Routing
+        # them here too would yield duplicate responses.
+        if prefix == "/":
             return
 
         text = event.message_str.strip()
