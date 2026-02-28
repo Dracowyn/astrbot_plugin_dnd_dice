@@ -418,6 +418,7 @@ def _roll_group(
     max_sides: int,
     exploding_depth: int,
     reroll_max_depth: int = 20,
+    max_total_rolled: int = 500,
 ) -> DiceGroupResult:
     """掷一组骰子并返回结果（编排各辅助函数）。"""
     if group.count > max_dice:
@@ -465,6 +466,12 @@ def _roll_group(
 
     all_rolls = raw_rolls + exploded_extra
 
+    # 全局追加骰上限：防止多骰+大爆炸深度组合产生过大列表。
+    if len(all_rolls) > max_total_rolled:
+        raise DiceRollError(
+            f"爆炸骰追加后本组总骰子数 {len(all_rolls)} 超过上限 {max_total_rolled}"
+        )
+
     # --- 4. Keep / Drop（转换 drop → keep 后统一走索引路径）---
     effective_keep_mode = group.keep_mode
     effective_keep_n = group.keep_n
@@ -505,6 +512,12 @@ def _roll_group(
         raw_rolls, exploded_extra, per_slot_histories, dropped_positions
     )
 
+    # --- 8. 对 die_rolls 应用排序，与 all_rolls 展示顺序保持一致 ---
+    # 格式化器优先使用 die_rolls；若不在此同步排序，s/sd 修饰在
+    # 最终输出中不会生效（输出仍按原始投掷顺序显示）。
+    if group.sort_order is not None:
+        die_rolls.sort(key=lambda d: d.value, reverse=(group.sort_order == "desc"))
+
     return DiceGroupResult(
         group=group,
         all_rolls=all_rolls,
@@ -530,11 +543,17 @@ def roll(
     max_sides: int = 1000,
     exploding_depth: int = 20,
     reroll_max_depth: int = 20,
+    max_total_rolled: int = 500,
 ) -> RollResult:
     """
     执行 ParsedExpression 并返回 RollResult。
 
     任何骰子组违反配置限制时抛出 DiceRollError。
+
+    Args:
+        max_total_rolled: 单组骰子（含爆炸追加骰）的总数量上限。
+            独立于 max_dice，防止 max_dice * exploding_depth 量级的组合
+            产生过大列表和格式化开销。默认 500。
     """
     # 全局预算检查：单组限制无法防止多组合计超出 max_dice。
     total_base_dice = sum(g.count for g in expr.groups)
@@ -544,6 +563,13 @@ def roll(
         )
     result = RollResult(expression=expr)
     for group in expr.groups:
-        gr = _roll_group(group, max_dice, max_sides, exploding_depth, reroll_max_depth)
+        gr = _roll_group(
+            group,
+            max_dice,
+            max_sides,
+            exploding_depth,
+            reroll_max_depth,
+            max_total_rolled,
+        )
         result.group_results.append(gr)
     return result
