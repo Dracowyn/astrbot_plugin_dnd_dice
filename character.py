@@ -123,9 +123,10 @@ class CharacterSheet:
             self.level = max(1, min(20, int(self.level)))
         except (TypeError, ValueError):
             self.level = 1
-        # 将熟练集合统一转为小写，保证查询时大小写一致
-        self.skill_proficiencies = {s.lower() for s in self.skill_proficiencies}
-        self.save_proficiencies = {s.lower() for s in self.save_proficiencies}
+        # 将熟练集合统一转为小写，保证查询时大小写一致。
+        # 用 or () 兜底：外部传入 None（插件生态中常见）时不触发 TypeError。
+        self.skill_proficiencies = {s.lower() for s in (self.skill_proficiencies or ())}
+        self.save_proficiencies = {s.lower() for s in (self.save_proficiencies or ())}
 
     @property
     def proficiency_bonus(self) -> int:
