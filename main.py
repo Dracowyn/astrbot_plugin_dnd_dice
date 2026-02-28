@@ -44,13 +44,13 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-# Maximum number of session origins to keep in the in-memory prefix cache.
-_PREFIX_CACHE_MAX: int = 512
-
 from .character import CharacterManager
 from .dice_parser import DiceParseError, parse
 from .dice_roller import DiceRollError, roll
 from .formatter import format_result
+
+# Maximum number of session origins to keep in the in-memory prefix cache.
+_PREFIX_CACHE_MAX: int = 512
 
 # ---------------------------------------------------------------------------
 # 配置读取辅助函数
