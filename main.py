@@ -72,7 +72,7 @@ def _safe_bool(value: object, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.lower() not in ("false", "0", "no", "off", "")
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
     try:
         return bool(value)
     except Exception:
@@ -203,7 +203,10 @@ class DnDDicePlugin(Star):
 
     async def _whitelist_check(self, event: AstrMessageEvent) -> bool:
         """
-        通用白名单验证（不含功能开关检查）。
+        管理命令白名单验证（不含功能开关检查）。
+
+        注意：此白名单仅限制 /dset 和 /rprefix 等管理命令的使用权限，
+        不影响 /r 掷骰指令（掷骰对所有用户始终开放）。
 
         判断顺序：
         1. enable_whitelist 为 False → 始终允许
@@ -281,6 +284,80 @@ class DnDDicePlugin(Star):
             return "掷骰完成，但系统内部错误"
 
     # ------------------------------------------------------------------
+    # /dset 命令核心逻辑（供标准命令和自定义前缀路由共用）
+    # ------------------------------------------------------------------
+
+    async def _handle_dset(
+        self, event: AstrMessageEvent, arg: str, display_prefix: str = "/"
+    ) -> AsyncGenerator:
+        """
+        /dset 命令核心逻辑，由 dset_cmd 和 custom_prefix_route 统一调用。
+
+        Args:
+            event: 消息事件。
+            arg: 去除命令名后的参数字符串（空字符串表示仅查询）。
+            display_prefix: 回复提示中显示的前缀符号（如 '/' 或自定义符号）。
+        """
+        key = f"session_sides:{event.unified_msg_origin}"
+
+        # 查询当前设置
+        if not arg:
+            current = await self._get_effective_sides(event)
+            is_session_set = await self.get_kv_data(key, None) is not None
+            source = "会话设置" if is_session_set else "默认"
+            yield event.plain_result(
+                f"当前默认骰面数: d{current}（{source}）\n"
+                f"用法: {display_prefix}dset <面数>\n"
+                f"示例: {display_prefix}dset 6\n"
+                f"重置: {display_prefix}dset reset\n"
+            )
+            return
+
+        # 权限检查
+        if not await self._check_permission(event):
+            if not self.allow_session_dice_sides:
+                yield event.plain_result("管理员已禁用会话骰面设置功能。")
+            else:
+                yield event.plain_result(
+                    "你没有权限使用此命令。"
+                    + (
+                        "（白名单模式已启用，请联系管理员）"
+                        if self.enable_whitelist
+                        else ""
+                    )
+                )
+            return
+
+        # 重置会话设置
+        if arg.lower() in ("reset", "重置", "0"):
+            await self.delete_kv_data(key)
+            yield event.plain_result(
+                f"已清除骰面设置，恢复为默认 d{self.default_dice_sides}。"
+            )
+            return
+
+        # 解析并验证面数
+        try:
+            new_sides = int(arg)
+        except ValueError:
+            yield event.plain_result(
+                f"无效的面数: '{arg}'，请输入 2~{self.max_dice_sides} 之间的整数，或 reset 重置。"
+            )
+            return
+
+        if new_sides < 2:
+            yield event.plain_result("骰面数不能小于 2。")
+            return
+        if new_sides > self.max_dice_sides:
+            yield event.plain_result(f"骰面数不能超过限制 {self.max_dice_sides}。")
+            return
+
+        await self.put_kv_data(key, new_sides)
+        yield event.plain_result(
+            f"已将当前默认骰面数设为 d{new_sides}。后续 {display_prefix}r 将默认投掷 d{new_sides}。"
+        )
+
+    # ------------------------------------------------------------------
     # /r 指令处理器
     # ------------------------------------------------------------------
 
@@ -325,67 +402,8 @@ class DnDDicePlugin(Star):
         raw_msg: str = event.message_str.strip()
         parts = raw_msg.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
-
-        # 查询当前设置
-        if not arg:
-            current = await self._get_effective_sides(event)
-            key = f"session_sides:{event.unified_msg_origin}"
-            is_session_set = await self.get_kv_data(key, None) is not None
-            source = "会话设置" if is_session_set else "默认"
-            yield event.plain_result(
-                f"当前默认骰面数: d{current}（{source}）\n"
-                # f"全局默认: d{self.default_dice_sides}\n"
-                f"用法: /dset <面数>\n"
-                f"示例: /dset 6\n"
-                f"重置: /dset reset\n"
-            )
-            return
-
-        # 权限检查
-        if not await self._check_permission(event):
-            if not self.allow_session_dice_sides:
-                yield event.plain_result("管理员已禁用会话骰面设置功能。")
-            else:
-                yield event.plain_result(
-                    "你没有权限使用此命令。"
-                    + (
-                        "（白名单模式已启用，请联系管理员）"
-                        if self.enable_whitelist
-                        else ""
-                    )
-                )
-            return
-
-        key = f"session_sides:{event.unified_msg_origin}"
-
-        # 重置会话设置
-        if arg.lower() in ("reset", "重置", "0"):
-            await self.delete_kv_data(key)
-            yield event.plain_result(
-                f"已清除骰面设置，恢复为默认 d{self.default_dice_sides}。"
-            )
-            return
-
-        # 解析并验证面数
-        try:
-            new_sides = int(arg)
-        except ValueError:
-            yield event.plain_result(
-                f"无效的面数: '{arg}'，请输入 2~{self.max_dice_sides} 之间的整数，或 reset 重置。"
-            )
-            return
-
-        if new_sides < 2:
-            yield event.plain_result("骰面数不能小于 2。")
-            return
-        if new_sides > self.max_dice_sides:
-            yield event.plain_result(f"骰面数不能超过限制 {self.max_dice_sides}。")
-            return
-
-        await self.put_kv_data(key, new_sides)
-        yield event.plain_result(
-            f"已将当前默认骰面数设为 d{new_sides}。后续 /r 将默认投掷 d{new_sides}。"
-        )
+        async for msg in self._handle_dset(event, arg, display_prefix="/"):
+            yield msg
 
     @filter.command("rprefix")
     async def rprefix_cmd(self, event: AstrMessageEvent) -> AsyncGenerator:
@@ -414,8 +432,8 @@ class DnDDicePlugin(Star):
                 )
             else:
                 yield event.plain_result(
-                    f"当前未设置自定义前缀，使用系统默认前缀\n"
-                    f"用法：/rprefix <前缀> 设置前缀（如 /rprefix . 或 /rprefix !）"
+                    "当前未设置自定义前缀，使用系统默认前缀\n"
+                    "用法：/rprefix <前缀> 设置前缀（如 /rprefix . 或 /rprefix !）"
                 )
             return
 
@@ -499,69 +517,8 @@ class DnDDicePlugin(Star):
                 or text_lower.startswith(cmd_key + "\n")
             ):
                 arg = text[len(cmd_key) :].strip()
-                key = f"session_sides:{event.unified_msg_origin}"
-
-                if not arg:
-                    current = await self._get_effective_sides(event)
-                    is_session_set = await self.get_kv_data(key, None) is not None
-                    source = "会话设置" if is_session_set else "默认"
-                    yield event.plain_result(
-                        f"当前默认骰面数: d{current}（{source}）\n"
-                        f"用法: {prefix}dset <面数>\n"
-                        f"示例: {prefix}dset 6\n"
-                        f"重置: {prefix}dset reset"
-                    )
-                    event.stop_event()
-                    return
-
-                if not await self._check_permission(event):
-                    if not self.allow_session_dice_sides:
-                        yield event.plain_result("管理员已禁用会话骰面设置功能。")
-                    else:
-                        yield event.plain_result(
-                            "你没有权限使用此命令。"
-                            + (
-                                "（白名单模式已启用，请联系管理员）"
-                                if self.enable_whitelist
-                                else ""
-                            )
-                        )
-                    event.stop_event()
-                    return
-
-                if arg.lower() in ("reset", "重置", "0"):
-                    await self.delete_kv_data(key)
-                    yield event.plain_result(
-                        f"已清除骰面设置，恢复为默认 d{self.default_dice_sides}。"
-                    )
-                    event.stop_event()
-                    return
-
-                try:
-                    new_sides = int(arg)
-                except ValueError:
-                    yield event.plain_result(
-                        f"无效的面数: '{arg}'，请输入 2~{self.max_dice_sides} 之间的整数，或 reset 重置。"
-                    )
-                    event.stop_event()
-                    return
-
-                if new_sides < 2:
-                    yield event.plain_result("骰面数不能小于 2。")
-                    event.stop_event()
-                    return
-                if new_sides > self.max_dice_sides:
-                    yield event.plain_result(
-                        f"骰面数不能超过限制 {self.max_dice_sides}。"
-                    )
-                    event.stop_event()
-                    return
-
-                await self.put_kv_data(key, new_sides)
-                yield event.plain_result(
-                    f"已将当前默认骰面数设为 d{new_sides}。"
-                    f"后续 {prefix}r 将默认投掷 d{new_sides}。"
-                )
+                async for msg in self._handle_dset(event, arg, display_prefix=prefix):
+                    yield msg
                 event.stop_event()
                 return
 
@@ -595,10 +552,9 @@ class DnDDicePlugin(Star):
                 - 多骰组合: "2d6+1d4", "1d8+1d6+5"
             label(string): 本次投掷的说明，不需要标签时传空字符串。
                 - 仅说明: "攻击检定", "力量豁免", "火球伤害"
-                - 含 DC 判定（有空格）: "感知 15", "奥秘检定 12"
+                - 含 DC 判定: "感知 15", "奥秘检定 12"（标签与 DC 之间必须有空格）
                   → 掷骰总计 >= DC 时输出"成功"，否则"失败"
                   → 天然 20 强制为"大成功"，天然 1 强制为"大失败"
-                - 含 DC 判定（无空格）: "感知15", "奥秘检定12"（与上等价）
         """
         # 将标签拼入表达式，交给解析器处理。
         if label:
