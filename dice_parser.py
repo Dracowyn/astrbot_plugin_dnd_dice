@@ -22,6 +22,7 @@ dice_parser.py — DnD 骰池表达式解析器。
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -294,6 +295,21 @@ def _parse_dice_token(expr: str, pos: int) -> tuple[DiceGroup | None, int]:
 
     返回 (DiceGroup, new_pos) 或 (None, pos)（未能匹配时）。
     内部依次调用五个独立子解析器处理各类修饰符。
+
+    子解析器扩展约定
+    ----------------
+    每个子解析器的函数签名如下::
+
+        def _parse_XYZ(expr: str, pos: int, group: DiceGroup) -> int:
+
+    须满足：
+    * 只消耗其能识别的字符，相应推进 *pos*；
+    * 修饰符不存在时返回原始 *pos* 不变；
+    * 就地修改 *group* 以记录已解析的选项；
+    * 不抛出异常——输入模糊时应回退（返回预读前的 pos）而非修改 *group*。
+
+    新增修饰符应作为额外的子解析器实现，并追加到本函数末尾
+    _parse_sort 调用链之后。
     """
     start = pos
     n = len(expr)
@@ -340,7 +356,8 @@ def _strip_label(raw: str) -> tuple[str, str]:
 
     分离策略（优先级从高到低）：
       1. '#' 强制分隔符，优先处理。
-      2. 在首个非 ASCII 字符（如中文）处截断——兼容『d20 感知 15』、
+      2. 在首个非 ASCII *字母* 字符处截断（Unicode 类别 L*，如 CJK、假名；
+         非 ASCII 标点/符号不触发）——兼容『d20 感知 15』、
          『2d6 + 1d4 伤害』（先找非 ASCII 再处理空格，避免算式空格误判为标签）。
       3. 以第一个空白字符切分：
          a. 若空白后紧跟 +/- 运算符，整体去空格视为纯算式，无标签。
@@ -358,11 +375,15 @@ def _strip_label(raw: str) -> tuple[str, str]:
         parts = raw.split("#", 1)
         return parts[0].strip(), parts[1].strip()
 
-    # 2. 在首个非 ASCII 字符处截断（此步须在空白检测之前，
+    # 2. 在首个非 ASCII *字母* 字符处截断（此步须在空白检测之前，
     #    否则 '2d6 + 1d4 伤害' 会在第一个空格处就被截断）。
-    non_ascii = re.search(r"[^\x00-\x7F]", raw)
-    if non_ascii:
-        return raw[: non_ascii.start()].strip(), raw[non_ascii.start() :].strip()
+    #    仅对 Unicode 字母类别（unicodedata.category 以 'L' 开头，
+    #    即 Lu/Ll/Lt/Lm/Lo，涵盖汉字、假名等自然语言文字）触发截断；
+    #    非 ASCII 标点/符号（如 em-dash U+2013、NBSP U+00A0）不触发，
+    #    避免对含有此类字符的算式表达式进行误分割。
+    for i, ch in enumerate(raw):
+        if ord(ch) > 0x7F and unicodedata.category(ch).startswith("L"):
+            return raw[:i].strip(), raw[i:].strip()
 
     # 3. 以第一个空白字符切分（纯 ASCII 输入）。
     ws_match = re.search(r"\s", raw)
