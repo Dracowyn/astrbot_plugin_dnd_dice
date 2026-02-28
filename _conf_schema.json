@@ -95,5 +95,28 @@
             "max": 1000,
             "step": 10
         }
+    },
+    "enable_history": {
+        "description": "启用投掷历史记录",
+        "hint": "开启后，每次成功投掷都会被记录到会话历史，可通过 /rh 命令查看",
+        "type": "bool",
+        "default": true
+    },
+    "allow_view_history": {
+        "description": "允许用户查看投掷历史",
+        "hint": "关闭后，即使历史记录功能开启，用户也无法通过 /rh 命令查看历史",
+        "type": "bool",
+        "default": true
+    },
+    "max_history_count": {
+        "description": "每个会话最多保留的历史记录数",
+        "hint": "超出此数量后，最旧的记录会被自动删除",
+        "type": "int",
+        "default": 50,
+        "slider": {
+            "min": 5,
+            "max": 500,
+            "step": 5
+        }
     }
 }

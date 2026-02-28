@@ -4,6 +4,10 @@ main.py — AstrBot DnD D20 骰子插件入口。
 指令：
   /r [表达式]    使用 DnD 骰池语法掷骰。
   /roll [表达式] /r 的别名。
+  /rh [me|all|clear]  查看或清空当前会话的投掷历史记录。
+    无参数 / all：群聊显示全员历史，私聊显示本人历史。
+    me：仅显示自己的投掷记录（群聊内使用）。
+    clear：清空当前会话历史（群聊需白名单权限）。
 
 支持的骰池语法（Roll20 规范）：
   d20                    单个 d20。
@@ -50,6 +54,7 @@ from .character import CharacterManager
 from .dice_parser import DiceParseError, parse
 from .dice_roller import DiceRollError, roll
 from .formatter import format_result
+from .history import ROLL_ERROR_PREFIXES, RollHistoryManager
 
 # 内存前缀缓存所允许的最大会话来源数量。
 _PREFIX_CACHE_MAX: int = 512
@@ -160,6 +165,20 @@ class DnDDicePlugin(Star):
             cfg.get("allow_custom_prefix"), True
         )
 
+        # 投掷历史配置
+        self.enable_history: bool = _safe_bool(cfg.get("enable_history"), True)
+        self.allow_view_history: bool = _safe_bool(cfg.get("allow_view_history"), True)
+        self.max_history_count: int = _safe_int(
+            cfg.get("max_history_count"), 50, min_val=1
+        )
+
+        # 投掷历史管理器
+        self._history = RollHistoryManager(
+            star=self,
+            max_count=self.max_history_count,
+            enabled=self.enable_history,
+        )
+
         # 角色卡管理器延迟初始化，避免核心接口尚未实现时被意外调用
         self._character_manager: CharacterManager | None = None
 
@@ -185,7 +204,9 @@ class DnDDicePlugin(Star):
             "[dnd_dice] DnD D20 骰子插件已加载。"
             f"限制: 最多骰子数={self.max_dice_count}, 最大面数={self.max_dice_sides}, "
             f"爆炸深度={self.exploding_max_depth}, 显示明细={self.show_detail}, "
-            f"默认骰面={self.default_dice_sides}, 允许会话设置={self.allow_session_dice_sides}"
+            f"默认骰面={self.default_dice_sides}, 允许会话设置={self.allow_session_dice_sides}, "
+            f"启用历史={self.enable_history}, 允许查看历史={self.allow_view_history}, "
+            f"最大历史记录数={self.max_history_count}"
         )
 
     # ------------------------------------------------------------------
@@ -423,6 +444,8 @@ class DnDDicePlugin(Star):
             expression_str = f"d{effective_sides}"
 
         output = self._do_roll(expression_str, default_sides=effective_sides)
+        if not output.startswith(ROLL_ERROR_PREFIXES):
+            await self._history.add(event, expression_str, output)
         yield event.plain_result(output)
 
     # ------------------------------------------------------------------
@@ -533,6 +556,83 @@ class DnDDicePlugin(Star):
             f"也可继续使用 /r 等前缀。"
         )
 
+    # ------------------------------------------------------------------
+    # /rh 指令：投掷历史记录
+    # ------------------------------------------------------------------
+
+    async def _handle_rhistory(
+        self, event: AstrMessageEvent, arg: str
+    ) -> AsyncGenerator:
+        """
+        /rh 命令核心逻辑，由 rhistory_cmd 和 custom_prefix_route 统一调用。
+
+        Args:
+            event: 消息事件。
+            arg: 去除命令名后的参数字符串（空字符串表示查询全部/默认模式）。
+        """
+        if not self.enable_history:
+            yield event.plain_result("投掷历史记录功能未启用。")
+            return
+
+        arg_lower = arg.lower()
+
+        # --- 清除历史 ---
+        if arg_lower in ("clear", "清除", "清空"):
+            # 群聊需白名单权限；私聊任何人均可清除自己的历史
+            if not event.is_private_chat() and not await self._whitelist_check(event):
+                yield event.plain_result("你没有权限清除群聊中的投掷历史记录。")
+                return
+            count = await self._history.clear(event)
+            yield event.plain_result(
+                f"已清空投掷历史，共删除 {count} 条记录。"
+                if count
+                else "当前暂无投掷历史记录。"
+            )
+            return
+
+        # --- 查看历史（需检查查看权限）---
+        if not self.allow_view_history:
+            yield event.plain_result("管理员已禁用投掷历史查看功能。")
+            return
+
+        is_group = not event.is_private_chat()
+
+        if arg_lower in ("me",):
+            # 仅显示自己的记录（群聊过滤，私聊无差别）
+            sender_id = str(event.get_sender_id())
+            sender_name = str(event.get_sender_name())
+            entries = await self._history.get_by_sender(event, sender_id)
+            # 群聊中明确显示是谁的记录，避免歧义。
+            title = f"{sender_name} 的投掷记录" if is_group else "我的投掷记录"
+            text = RollHistoryManager.format_entries(
+                entries, show_sender=False, title=title
+            )
+            yield event.plain_result(text)
+            return
+
+        # 默认：all 或空白
+        entries = await self._history.get_all(event)
+        # 群聊显示发送者昵称(ID)，便于区分同名用户；私聊不显示
+        text = RollHistoryManager.format_entries(entries, show_sender=is_group)
+        yield event.plain_result(text)
+
+    @filter.command("rh", alias={"rhistory"})
+    async def rhistory_cmd(self, event: AstrMessageEvent) -> AsyncGenerator:
+        """
+        查看或清除当前会话的投掷历史记录。
+
+        用法:
+          /rh           查看会话全部历史（群聊含发送者，私聊不显示）
+          /rh all       同无参数
+          /rh me        仅显示自己的投掷记录（群聊内使用）
+          /rh clear     清空当前会话历史（群聊需白名单权限）
+        """
+        raw_msg: str = event.message_str.strip()
+        parts = raw_msg.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        async for msg in self._handle_rhistory(event, arg):
+            yield msg
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def custom_prefix_route(self, event: AstrMessageEvent) -> AsyncGenerator:
         """
@@ -569,6 +669,8 @@ class DnDDicePlugin(Star):
                 effective_sides = await self._get_effective_sides(event)
                 expression_str = arg_part if arg_part else f"d{effective_sides}"
                 output = self._do_roll(expression_str, default_sides=effective_sides)
+                if not output.startswith(ROLL_ERROR_PREFIXES):
+                    await self._history.add(event, expression_str, output)
                 yield event.plain_result(output)
                 event.stop_event()
                 return
@@ -582,6 +684,18 @@ class DnDDicePlugin(Star):
             ):
                 arg = text[len(cmd_key) :].strip()
                 async for msg in self._handle_dset(event, arg, display_prefix=prefix):
+                    yield msg
+                event.stop_event()
+                return
+        # --- 历史记录指令匹配 ---
+        for cmd_key in (f"{p}rhistory", f"{p}rh"):
+            if (
+                text_lower == cmd_key
+                or text_lower.startswith(cmd_key + " ")
+                or text_lower.startswith(cmd_key + "\n")
+            ):
+                arg = text[len(cmd_key) :].strip()
+                async for msg in self._handle_rhistory(event, arg):
                     yield msg
                 event.stop_event()
                 return
@@ -615,6 +729,8 @@ class DnDDicePlugin(Star):
         output = self._do_roll(full_expr, default_sides=effective_sides)
 
         # 将结果返回给 LLM，由 LLM 将骰点结果融入叙事后回复用户。
+        if not output.startswith(ROLL_ERROR_PREFIXES):
+            await self._history.add(event, full_expr, output)
         return output
 
     # ------------------------------------------------------------------
