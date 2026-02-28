@@ -322,20 +322,7 @@ class DnDDicePlugin(Star):
         """
         key = f"session_sides:{event.unified_msg_origin}"
 
-        # 查询当前设置
-        if not arg:
-            current = await self._get_effective_sides(event)
-            is_session_set = await self.get_kv_data(key, None) is not None
-            source = "会话设置" if is_session_set else "默认"
-            yield event.plain_result(
-                f"当前默认骰面数: d{current}（{source}）\n"
-                f"用法: {display_prefix}dset <面数>\n"
-                f"示例: {display_prefix}dset 6\n"
-                f"重置: {display_prefix}dset reset\n"
-            )
-            return
-
-        # 权限检查
+        # 权限检查（查询与写入均需授权，防止未授权用户探测会话配置）
         if not await self._check_permission(event):
             if not self.allow_session_dice_sides:
                 yield event.plain_result("管理员已禁用会话骰面设置功能。")
@@ -348,6 +335,19 @@ class DnDDicePlugin(Star):
                         else ""
                     )
                 )
+            return
+
+        # 查询当前设置
+        if not arg:
+            current = await self._get_effective_sides(event)
+            is_session_set = await self.get_kv_data(key, None) is not None
+            source = "会话设置" if is_session_set else "默认"
+            yield event.plain_result(
+                f"当前默认骰面数: d{current}（{source}）\n"
+                f"用法: {display_prefix}dset <面数>\n"
+                f"示例: {display_prefix}dset 6\n"
+                f"重置: {display_prefix}dset reset\n"
+            )
             return
 
         # 重置会话设置
@@ -491,6 +491,13 @@ class DnDDicePlugin(Star):
             yield event.plain_result("前缀过长，建议使用 1~2 个字符（如 . 或 !!）。")
             return
 
+        # 前缀字符集校验：不允许空白字符或字母，避免路由歧义和误触发。
+        if any(c.isspace() or c.isalpha() for c in arg):
+            yield event.plain_result(
+                "前缀不能包含空白字符或字母，请使用标点/符号（如 . ! ~ !! 等）。"
+            )
+            return
+
         await self.put_kv_data(key, arg)
         self._set_prefix_cache(event.unified_msg_origin, arg)
         yield event.plain_result(
@@ -507,6 +514,11 @@ class DnDDicePlugin(Star):
         读取会话或全局配置的自定义前缀，将 {prefix}r / {prefix}roll / {prefix}dset 等
         消息路由到对应的掷骰或骰面设置逻辑。
         """
+        # 非文本或空消息无触发前缀可言，先过滤，避免对每条消息都查询缓存/KV。
+        text = event.message_str.strip()
+        if not text:
+            return
+
         prefix = await self._get_effective_prefix(event)
         if not prefix:
             return
@@ -514,10 +526,6 @@ class DnDDicePlugin(Star):
         # @filter.command 装饰器已处理这些消息，此处不再路由，
         # 否则会触发重复响应。
         if prefix == "/":
-            return
-
-        text = event.message_str.strip()
-        if not text:
             return
 
         text_lower = text.lower()
