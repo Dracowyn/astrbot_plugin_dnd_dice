@@ -390,6 +390,8 @@ def _strip_label(raw: str) -> tuple[str, str]:
     #    即 Lu/Ll/Lt/Lm/Lo，涵盖汉字、假名等自然语言文字）触发截断；
     #    非 ASCII 标点/符号（如 em-dash U+2013、NBSP U+00A0）不触发，
     #    避免对含有此类字符的算式表达式进行误分割。
+    # 注意：此策略在首个非 ASCII 字母处截断。若未来表达式语法扩展至
+    # 含非 ASCII 标识符，需在此处添加白名单豁免，避免误截断。
     for i, ch in enumerate(raw):
         if ord(ch) > 0x7F and unicodedata.category(ch).startswith("L"):
             return raw[:i].strip(), raw[i:].strip()
@@ -401,7 +403,8 @@ def _strip_label(raw: str) -> tuple[str, str]:
         # 若空白后紧跟运算符，说明这是算式内部空格（如 '2d6 + 1d4'），
         # 去除所有空格后整体作为表达式，不分离标签。
         if after and after[0] in ("+", "-"):
-            return raw.replace(" ", "").replace("\t", ""), ""
+            # 移除全部空白字符（含 \n、\r 等），而非仅空格和制表符。
+            return re.sub(r"\s+", "", raw), ""
         return raw[: ws_match.start()].strip(), raw[ws_match.start() :].strip()
 
     # 4. 纯 ASCII、无分隔符：整体作为表达式。
