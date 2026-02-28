@@ -134,8 +134,8 @@ def _annotate_die(die: DieRoll, gr: DiceGroupResult) -> str:
             ):
                 raw = f"{raw}x"
         return f"{raw}!"
-    # state 为 "kept"（保留）或 "dropped"（已丢弃）时到达此处
-    if gr.is_success_mode and die.state == "kept":
+    # state 为 "kept"/"kept_capped"（保留）或 "dropped"（已丢弃）时到达此处
+    if gr.is_success_mode and die.state in ("kept", "kept_capped"):
         if g.success_compare and g.success_value is not None:
             if _cmp(die.value, g.success_compare, g.success_value):
                 raw = f"{raw}*"
@@ -147,6 +147,9 @@ def _annotate_die(die: DieRoll, gr: DiceGroupResult) -> str:
                 raw = f"{raw}x"
     if die.state == "dropped":
         return f"({raw})"
+    if die.state == "kept_capped":
+        # 重骰深度耗尽，最终值仍落在应重骰区间——加 '?' 后缀提示。
+        return f"{raw}?"
     return raw
 
 
