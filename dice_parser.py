@@ -400,11 +400,18 @@ def _strip_label(raw: str) -> tuple[str, str]:
     ws_match = re.search(r"\s", raw)
     if ws_match:
         after = raw[ws_match.start() :].lstrip()
-        # 若空白后紧跟运算符，说明这是算式内部空格（如 '2d6 + 1d4'），
-        # 去除所有空格后整体作为表达式，不分离标签。
+        # 若空白后紧跟运算符，说明这是算式内部空格（如 '2d6 + 1d4'）。
+        # 仅归一化运算符周围的空格（' + ' → '+'），保留运算符后的非算式内容。
+        # 例如 '2d6 + 1d4 damage' → '2d6+1d4 damage'，标签不被并入表达式。
         if after and after[0] in ("+", "-"):
-            # 移除全部空白字符（含 \n、\r 等），而非仅空格和制表符。
-            return re.sub(r"\s+", "", raw), ""
+            normalized = re.sub(r"\s*([+\-])\s*", r"\1", raw)
+            ws_match2 = re.search(r"\s", normalized)
+            if ws_match2:
+                return (
+                    normalized[: ws_match2.start()].strip(),
+                    normalized[ws_match2.start() :].strip(),
+                )
+            return normalized, ""
         return raw[: ws_match.start()].strip(), raw[ws_match.start() :].strip()
 
     # 4. 纯 ASCII、无分隔符：整体作为表达式。
