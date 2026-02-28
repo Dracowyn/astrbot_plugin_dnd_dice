@@ -30,7 +30,7 @@ class DieRoll:
     """单枚骰子的带状态注解结果。"""
 
     value: int
-    state: str  # "kept" | "dropped" | "rerolled" | "exploded"
+    state: str  # 骰子状态："kept"（保留）| "dropped"（丢弃）| "rerolled"（重骰）| "exploded"（爆炸追加）
 
 
 @dataclass
@@ -250,7 +250,9 @@ def _apply_rerolls(
                         depth += 1
                 break  # 一个骰值只触发第一个匹配的条件
 
-        history.append((val, "kept"))  # 状态在后续 keep/drop 阶段可能进一步改为 "dropped"
+        history.append(
+            (val, "kept")
+        )  # 状态在后续 keep/drop 阶段可能进一步改为 "dropped"
         final.append(val)
         histories.append(history)
 
@@ -296,7 +298,7 @@ def _explode_after_reroll(
                 depth += 1
                 curr = max(1, _roll_single(sides) - 1)
                 exploded_extra.append(curr)
-    else:  # standard
+    else:  # 标准爆炸模式
         for v in raw_rolls:
             depth = 0
             curr = v
@@ -338,7 +340,7 @@ def _apply_keep_drop_indexed(
 
     if effective_keep_mode == "kh":
         kept_indices = {idx for idx, _ in sorted_desc[:kn]}
-    else:  # kl
+    else:  # kl（保留最低）
         kept_indices = {idx for idx, _ in sorted_desc[len(pool) - kn :]}
 
     # 跟踪完整池（基础骰 + 爆炸追加骰）中所有被丢弃的位置索引，
@@ -472,7 +474,7 @@ def _roll_group(
         if group.drop_mode == "dl":
             effective_keep_mode = "kh"
             effective_keep_n = pool_size - dn
-        else:  # dh
+        else:  # dh（丢弃最高）
             effective_keep_mode = "kl"
             effective_keep_n = pool_size - dn
 

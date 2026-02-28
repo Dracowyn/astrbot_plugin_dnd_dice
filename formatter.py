@@ -124,7 +124,7 @@ def _annotate_die(die: DieRoll, gr: DiceGroupResult) -> str:
         return f"~{raw}~"
     if die.state == "exploded":
         return f"{raw}!"
-    # "kept" or "dropped"
+    # state 为 "kept"（保留）或 "dropped"（已丢弃）时到达此处
     if gr.is_success_mode and die.state == "kept":
         if g.success_compare and g.success_value is not None:
             if _cmp(die.value, g.success_compare, g.success_value):
