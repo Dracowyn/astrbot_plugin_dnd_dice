@@ -246,7 +246,12 @@ def _apply_rerolls(
                 else:
                     depth = 0
                     while _compare(val, cond.compare, cond.value) and depth < max_depth:
-                        val = _roll_fate() if fate else _roll_single(sides)
+                        new_val = _roll_fate() if fate else _roll_single(sides)
+                        # depth > 0 时当前 val 是中间重骰值，記录完整链路。
+                        # （depth == 0 时原始值已在循环外记录，此处跳过）
+                        if depth > 0:
+                            history.append((val, "rerolled"))
+                        val = new_val
                         depth += 1
                 break  # 一个骰值只触发第一个匹配的条件
 
@@ -488,11 +493,9 @@ def _roll_group(
     elif group.sort_order == "desc":
         kept_vals = sorted(kept_vals, reverse=True)
 
-    if group.sort_order is not None and not exploded_extra:
-        dropped_sorted = sorted(dropped_vals, reverse=(group.sort_order == "desc"))
-        all_rolls = sorted(
-            kept_vals + dropped_sorted, reverse=(group.sort_order == "desc")
-        )
+    if group.sort_order is not None:
+        # 对全部骰子（含爆炸追加骰）统一排序，确保 s/sd 语义在爆炸时也一致。
+        all_rolls = sorted(all_rolls, reverse=(group.sort_order == "desc"))
 
     # --- 6. 成功/失败计数 ---
     successes, failures = _count_successes(kept_vals, group)
