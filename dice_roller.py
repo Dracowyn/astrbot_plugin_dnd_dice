@@ -533,6 +533,12 @@ def roll(
 
     任何骰子组违反配置限制时抛出 DiceRollError。
     """
+    # 全局预算检查：单组限制无法防止多组合计超出 max_dice。
+    total_base_dice = sum(g.count for g in expr.groups)
+    if total_base_dice > max_dice:
+        raise DiceRollError(
+            f"表达式中骰子总数 {total_base_dice} 超过最大限制 {max_dice}"
+        )
     result = RollResult(expression=expr)
     for group in expr.groups:
         gr = _roll_group(group, max_dice, max_sides, exploding_depth, reroll_max_depth)
