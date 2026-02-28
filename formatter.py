@@ -192,6 +192,20 @@ def _rebuild_expr(result: RollResult) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _net_success_str(total_successes: int, total_failures: int) -> str:
+    """
+    将成功数/失败数格式化为可读字符串。
+
+    当负号组导致计数器出现负値时，改为展示净值，避免 '−N成功' 等语义难懂的输出。
+    """
+    if total_successes < 0 or total_failures < 0:
+        net = total_successes - total_failures
+        return f"{net}净成功" if net >= 0 else f"{abs(net)}净失败"
+    if total_failures:
+        return f"{total_successes}成功 {total_failures}失败"
+    return f"{total_successes}成功"
+
+
 def format_result(result: RollResult, show_detail: bool = True) -> str:
     """
     将 RollResult 格式化为单行纯文本字符串。
@@ -222,9 +236,7 @@ def format_result(result: RollResult, show_detail: bool = True) -> str:
                 total_failures += f
 
         if not show_detail:
-            if total_failures:
-                return f"{prefix} = {total_successes}成功 {total_failures}失败"
-            return f"{prefix} = {total_successes}成功"
+            return f"{prefix} = {_net_success_str(total_successes, total_failures)}"
 
         dice_parts = [_format_dice_list(gr) for gr in result.group_results]
         dice_str = " ".join(dice_parts)
@@ -233,14 +245,11 @@ def format_result(result: RollResult, show_detail: bool = True) -> str:
         if dc is not None:
             net = total_successes - total_failures
             judge = "成功" if net >= dc else "失败"
-            count_str = f"{total_successes}成功"
-            if total_failures:
-                count_str += f" {total_failures}失败"
+            count_str = _net_success_str(total_successes, total_failures)
             return f"{prefix}: {dice_str} = {count_str} / {dc} {judge}"
 
-        if total_failures:
-            return f"{prefix}: {dice_str} = {total_successes}成功 {total_failures}失败"
-        return f"{prefix}: {dice_str} = {total_successes}成功"
+        count_str = _net_success_str(total_successes, total_failures)
+        return f"{prefix}: {dice_str} = {count_str}"
 
     # --- 普通求和模式 ---
     if not show_detail:
