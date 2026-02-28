@@ -203,17 +203,22 @@ class DnDDicePlugin(Star):
         """
         origin = event.unified_msg_origin
         if origin not in self._prefix_cache:
-            # 缓存已满时驱逐最久未使用的条目。
-            if len(self._prefix_cache) >= _PREFIX_CACHE_MAX:
-                self._prefix_cache.popitem(last=False)
             kv_key = f"custom_prefix:{origin}"
             raw = await self.get_kv_data(kv_key, None)
-            self._prefix_cache[origin] = str(raw) if raw is not None else None
+            self._set_prefix_cache(origin, str(raw) if raw is not None else None)
         else:
             # 缓存命中时将条目提升至最近使用位置。
             self._prefix_cache.move_to_end(origin)
         cached = self._prefix_cache[origin]
         return cached if cached is not None else self.default_cmd_prefix
+
+    def _set_prefix_cache(self, origin: str, value: str | None) -> None:
+        """写入前缀缓存，内部自动执行容量检查与 LRU 驱逐，所有写入路径均通过此方法。"""
+        if origin not in self._prefix_cache and len(self._prefix_cache) >= _PREFIX_CACHE_MAX:
+            # 缓存已满 且 key 不在缓存中：驱逐最久未使用的条目。
+            self._prefix_cache.popitem(last=False)
+        self._prefix_cache[origin] = value
+        self._prefix_cache.move_to_end(origin)  # 提升至 MRU 位置
 
     async def _whitelist_check(self, event: AstrMessageEvent) -> bool:
         """
@@ -469,8 +474,7 @@ class DnDDicePlugin(Star):
         # 重置会话前缀
         if arg.lower() in ("reset", "重置", "清除"):
             await self.delete_kv_data(key)
-            self._prefix_cache[event.unified_msg_origin] = None  # 写透缓存
-            self._prefix_cache.move_to_end(event.unified_msg_origin)  # 提升至 MRU 位置
+            self._set_prefix_cache(event.unified_msg_origin, None)
             if self.default_cmd_prefix:
                 yield event.plain_result(
                     f"已清除自定义骰子前缀设置，恢复为默认前缀 {self.default_cmd_prefix!r}。"
@@ -485,8 +489,7 @@ class DnDDicePlugin(Star):
             return
 
         await self.put_kv_data(key, arg)
-        self._prefix_cache[event.unified_msg_origin] = arg  # 写透缓存
-        self._prefix_cache.move_to_end(event.unified_msg_origin)  # 提升至 MRU 位置
+        self._set_prefix_cache(event.unified_msg_origin, arg)
         yield event.plain_result(
             f"已将自定义骰子前缀设为 {arg!r}。\n"
             f"现在可用 {arg}r、{arg}roll、{arg}dset 等触发骰子功能，\n"
