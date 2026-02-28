@@ -214,7 +214,10 @@ class DnDDicePlugin(Star):
 
     def _set_prefix_cache(self, origin: str, value: str | None) -> None:
         """写入前缀缓存，内部自动执行容量检查与 LRU 驱逐，所有写入路径均通过此方法。"""
-        if origin not in self._prefix_cache and len(self._prefix_cache) >= _PREFIX_CACHE_MAX:
+        if (
+            origin not in self._prefix_cache
+            and len(self._prefix_cache) >= _PREFIX_CACHE_MAX
+        ):
             # 缓存已满 且 key 不在缓存中：驱逐最久未使用的条目。
             self._prefix_cache.popitem(last=False)
         self._prefix_cache[origin] = value
